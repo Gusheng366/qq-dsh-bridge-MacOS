@@ -32,6 +32,7 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 
 from dsh_api import DshApi
+from context_builder import build_context_message
 from reply_style import clean_reply, split_messages
 
 # ----------------------------------------------------------------------------
@@ -90,6 +91,12 @@ QUIET_HOURS = os.environ.get("QQ_QUIET_HOURS", "").strip()
 SPLIT_MAX_CHARS = int(os.environ.get("QQ_SPLIT_MAX_CHARS", "60"))
 # 拆条后随机只回第一条的概率（模拟真人在忙）
 SHORT_REPLY_PROBABILITY = float(os.environ.get("QQ_SHORT_REPLY_PROB", "0.10"))
+# 推理档位：low / high / max，留空则不设置（聊天建议 low，减少"分析腔"）
+REASONING_EFFORT = os.environ.get("QQ_REASONING_EFFORT", "low").strip()
+# 会话轮数上限：超过后自动新建会话并注入摘要，0 表示不限制
+MAX_SESSION_TURNS = int(os.environ.get("QQ_MAX_SESSION_TURNS", "40"))
+# 投递时附带的历史消息条数
+CONTEXT_HISTORY = int(os.environ.get("QQ_CONTEXT_HISTORY", "6"))
 
 # ----------------------------------------------------------------------------
 # Accessibility / CoreGraphics 绑定
@@ -407,26 +414,78 @@ class QQ:
         return False
 
     def read_chat_messages(self) -> list[str]:
+        """兼容接口：只返回文本片段列表。"""
+        return [m["text"] for m in self.read_chat_structured()]
+
+    def read_chat_structured(self) -> list[dict]:
+        """按消息气泡读取聊天记录，带发送方方向。
+
+        结果形如 [{"is_self": False, "text": "你好", "time": "23:07"}, ...]
+        QQ 用 class 标记方向：message-container--self 为自己发的。
+        """
         if self.window is None:
             return []
         area = self._walk(self.window, lambda e: self._has_class(e, "chat-msg-area"), 0, 20)
         if not area:
             return []
-        texts: list = []
 
-        def collect(el, d=0):
-            if d > 14:
-                return
-            role = ax_str(el, "AXRole")
-            if role in ("AXStaticText", "AXTextField", "AXTextArea"):
-                v = ax_str(el, "AXValue")
-                if v and v.strip():
-                    texts.append(v)
-            for c in ax_children(el):
-                collect(c, d + 1)
+        items: list = []
+        self._collect(area, lambda e: self._has_class(e, "ml-item"), items, 0, 22)
 
-        collect(area)
-        return texts
+        messages: list[dict] = []
+        time_pat = re.compile(r"^\d{1,2}:\d{2}$")
+
+        for item in items:
+            is_self = (
+                self._walk(item, lambda e: self._has_class(e, "message-container--self"), 0, 6)
+                is not None
+            )
+            texts: list[str] = []
+            stamp: list[str] = []
+
+            def grab(el, d=0):
+                if d > 14:
+                    return
+                role = ax_str(el, "AXRole")
+                val = ax_str(el, "AXValue")
+                if role in ("AXStaticText", "AXTextField") and val and val.strip():
+                    segment = val.strip()
+                    if time_pat.match(segment):
+                        stamp.append(segment)
+                    else:
+                        texts.append(segment)
+                elif role == "AXImage":
+                    desc = (ax_str(el, "AXDescription") or "").strip()
+                    title = (ax_str(el, "AXTitle") or "").strip()
+                    cls = ax_str(el, "AXDOMClassList") or ""
+                    if "emoji" in cls.lower() or "sticker" in cls.lower() or "表情" in desc:
+                        texts.append("[表情包]")
+                    elif desc and desc not in ("图像", "图片", "image"):
+                        texts.append(f"[图片：{desc}]")
+                    else:
+                        texts.append("[图片]")
+                elif role == "AXButton":
+                    # QQ 的图片/文件消息有时是按钮形式
+                    desc = (ax_str(el, "AXDescription") or "").strip()
+                    cls = ax_str(el, "AXDOMClassList") or ""
+                    if any(k in cls.lower() for k in ("image", "pic", "media", "file")):
+                        texts.append(f"[{desc or '图片/文件'}]")
+                for c in ax_children(el):
+                    grab(c, d + 1)
+
+            grab(item)
+            body = "\n".join(texts).strip()
+            if not body:
+                continue
+            messages.append(
+                {
+                    "is_self": is_self,
+                    "text": body,
+                    "time": stamp[0] if stamp else "",
+                }
+            )
+
+        return messages
 
     def input_box(self):
         if self.window is None:
@@ -622,6 +681,136 @@ def _read_turns(api: "DshApi", sid: str) -> list[dict]:
     return values.get("turnOutline") or []
 
 
+def count_turns(api: "DshApi", sid: str) -> int:
+    """当前会话已进行的轮数。"""
+    return len(_read_turns(api, sid))
+
+
+def maybe_rotate_session(
+    api: "DshApi", sid: str, max_turns: int, summary_hint: str = ""
+) -> str:
+    """轮数达到上限时新建会话，并把「之前聊过什么」作为开场白注入。
+
+    返回（可能被替换后的）会话 ID。
+    """
+    if max_turns <= 0:
+        return sid
+    turns = count_turns(api, sid)
+    if turns < max_turns:
+        return sid
+
+    log(f"会话已达 {turns} 轮（上限 {max_turns}），准备新建以控制上下文成本")
+
+    # 取最近几轮作为交接摘要
+    outline = _read_turns(api, sid)[-4:]
+    snippets: list[str] = []
+    for t in outline:
+        p = (t.get("prompt") or "").strip().replace("\n", " ")
+        r = (t.get("response") or "").strip().replace("\n", " ")
+        if not p:
+            continue
+        snippets.append(f"对方: {p[:60]} / 我: {r[:60]}")
+    carry = "；".join(snippets)
+
+    QQ_SESSION_CWD.mkdir(parents=True, exist_ok=True)
+    status, data = api.rpc("session/create", {"request": {"cwd": str(QQ_SESSION_CWD)}})
+    ok = (data.get("result") or {}).get("ok")
+    if status != 200 or not ok:
+        log("新建会话失败，继续使用旧会话", "WARN")
+        return sid
+
+    new_sid = data["result"]["value"]["sessionId"]
+    api.rpc(
+        "session/rename",
+        {"request": {"sessionId": new_sid, "title": f"QQ 聊天（{TARGET_REMARK}）"}},
+    )
+    SID_FILE.write_text(new_sid, "utf-8")
+    log(f"已切换到新会话: {new_sid}")
+
+    if carry:
+        seed = (
+            "[背景] 这是你和同一个人的连续聊天，之前聊过这些（不必复述，"
+            "只是让你接得上话）：" + carry
+        )
+        api.rpc(
+            "session/prompt",
+            {
+                "request": {
+                    "sessionId": new_sid,
+                    "requestId": str(uuid.uuid4()),
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": seed}],
+                }
+            },
+        )
+        log("已注入历史摘要")
+
+    apply_reasoning_effort(api, new_sid)
+    return new_sid
+
+
+def resolve_model(api: "DshApi", sid: str) -> tuple[str, str]:
+    """确定会话该用哪个 provider/model：优先现有选择，其次 DSH 默认。"""
+    provider, model = "", ""
+
+    status, data = api.rpc("session/projections", {"request": {"sessionId": sid}})
+    if status == 200:
+        values = ((data.get("result") or {}).get("value") or {}).get("values") or {}
+        sel = values.get("modelSelection") or {}
+        for key in ("next", "lastUsed"):
+            cur = sel.get(key) or {}
+            if cur.get("provider") and cur.get("model"):
+                provider, model = cur["provider"], cur["model"]
+                break
+
+    if not (provider and model):
+        status, data = api.rpc("session/modelCatalog", {})
+        if status == 200:
+            default = ((data.get("result") or {}).get("value") or {}).get("default") or {}
+            provider = default.get("provider") or ""
+            model = default.get("model") or ""
+
+    return provider, model
+
+
+def apply_reasoning_effort(api: "DshApi", sid: str) -> None:
+    """把会话的 reasoningEffort 调到配置档位，降低「分析腔」。
+
+    selectModel 必须同时给出 provider 与 model，否则会覆盖成默认值。
+    """
+    if not REASONING_EFFORT:
+        return
+    provider, model = resolve_model(api, sid)
+    if not (provider and model):
+        log("无法确定会话模型，跳过 reasoningEffort 设置", "WARN")
+        return
+
+    status, data = api.rpc(
+        "session/selectModel",
+        {
+            "request": {
+                "sessionId": sid,
+                "provider": provider,
+                "model": model,
+                "reasoningEffort": REASONING_EFFORT,
+            }
+        },
+    )
+    ok = (data.get("result") or {}).get("ok")
+    if status == 200 and ok:
+        selected = ((data.get("result") or {}).get("value") or {}).get("selected") or {}
+        log(
+            f"会话模型 {selected.get('provider', provider)}/{selected.get('model', model)}"
+            f" @ {selected.get('reasoningEffort', REASONING_EFFORT)}"
+        )
+    else:
+        log(
+            f"设置 reasoningEffort 失败（不影响使用）: "
+            f"{(data.get('result') or {}).get('error') or status}",
+            "WARN",
+        )
+
+
 def ask_dsh(text: str, api: "DshApi", sid: str) -> str:
     """把消息投递到 DSH 会话，并等待该轮回复产生。"""
     before = _read_turns(api, sid)
@@ -727,6 +916,7 @@ def main() -> int:
             log(f"无法连接 DSH Web 服务（{DSH_BASE_URL}）", "FATAL")
             return 2
         current_sid = pick_session(api)
+        apply_reasoning_effort(api, current_sid)
     except Exception as exc:  # noqa: BLE001
         log(f"初始化 DSH 连接失败: {exc}", "FATAL")
         return 2
@@ -791,15 +981,17 @@ def main() -> int:
                 qq.open_session(item)
                 time.sleep(0.6)
                 qq.refresh()
-                msgs = qq.read_chat_messages()
+                structured = qq.read_chat_structured()
 
                 user_text = ""
                 own = state.get("own_sent") or []
-                for m in reversed(msgs):
-                    s = m.strip()
-                    if not s or s == info["time"]:
+                for msg in reversed(structured):
+                    if msg.get("is_self"):
+                        continue  # 自己发的，跳过
+                    s = (msg.get("text") or "").strip()
+                    if not s:
                         continue
-                    # 跳过自己发过的消息
+                    # 再对一遍 own_sent，防止界面方向判断异常
                     if any(s == o.strip() or (o.strip() and o.strip().startswith(s[:20])) for o in own):
                         continue
                     user_text = s
@@ -808,7 +1000,25 @@ def main() -> int:
                     user_text = info["preview"].strip()
                 log(f"用户消息：{user_text[:100]!r}")
 
-                raw_reply = ask_dsh(user_text, api, current_sid)
+                # ── 输入层：拼情景头 + 最近对话 ──
+                prompt_text = build_context_message(
+                    user_text,
+                    history=structured,
+                    own_sent=own,
+                    partner_name=TARGET_REMARK,
+                    history_limit=CONTEXT_HISTORY,
+                )
+                log(f"  投递上下文 {len(prompt_text)} 字符")
+
+                # ── 第 8 项：轮数超限则滚动会话 ──
+                try:
+                    current_sid = maybe_rotate_session(
+                        api, current_sid, MAX_SESSION_TURNS
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log(f"会话轮转失败（继续用旧会话）: {exc}", "WARN")
+
+                raw_reply = ask_dsh(prompt_text, api, current_sid)
                 if not raw_reply:
                     log("DSH 无输出", "WARN")
 

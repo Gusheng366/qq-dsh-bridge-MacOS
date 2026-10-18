@@ -110,10 +110,13 @@ open 停止桥接.command
 | `QQ_SESSION_CWD` | `./qq-workspace` | QQ 专用会话的工作目录 |
 | `QQ_SPLIT_MAX_CHARS` | 60 | 拆条：单条消息最大字数 |
 | `QQ_SHORT_REPLY_PROB` | 0.10 | 随机只回第一条的概率（模拟真人在忙，0 关闭） |
+| `QQ_REASONING_EFFORT` | low | 推理档位 off/low/high/max，聊天建议 low |
+| `QQ_MAX_SESSION_TURNS` | 40 | 会话轮数上限，超过自动换新会话并注入摘要 |
+| `QQ_CONTEXT_HISTORY` | 6 | 投递时附带的历史条数 |
 
 ---
 
-## 让它说人话：三层改造
+## 让它说人话：五层改造
 
 默认的 DSH 会话挂的是 standard preset，persona 是「coding agent」，直接拿去聊天会输出分点、总结、结尾追问「还需要我做什么」——非常像客服。本项目用三层把它掰回来：
 
@@ -153,6 +156,42 @@ DSH 的 `dsh-agent-instructions` 会按 cwd 链把 `AGENTS.md` 作为持久基�
 - **随机敷衍**：10% 概率只发第一条
 
 配置项：`QQ_SPLIT_MAX_CHARS`、`QQ_SHORT_REPLY_PROB`。
+
+### 4. 输入层：情景头 + 最近对话
+
+`context_builder.py` 在投递前拼一段轻量背景（拼进同一条 user message，不用 system 注入，省 token）：
+
+```
+[2026-10-19 01:37 周一，QQ 私聊，对方备注：xxx]
+（以上只是背景，不必在回复里提到时间或来源）
+
+【最近对话】
+对方: 我明天要去面试
+我: 哪个公司啊
+对方: 一家做AI的
+
+【对方刚说】
+有点紧张
+```
+
+配套改动：`read_chat_structured()` 按消息气泡读取，靠 class 区分方向——
+`message-container--self` 是自己发的，否则是对方。这样历史里「谁说的」不会搞混。
+
+实测效果：同一句「有点紧张」，没有上下文时回「怎么了」，有上下文时回「紧张啥，又不是去相亲」。
+
+### 5. 成本控制：推理档位 + 会话轮转
+
+- **`QQ_REASONING_EFFORT`**（默认 `low`）：`high` 出来的内容天然带「我先分析一下」的骨架。
+  启动时通过 `session/selectModel` 设置，同时保留原有 provider/model 不乱改。
+- **`QQ_MAX_SESSION_TURNS`**（默认 40）：同一会话历史无限累积会让 token 越来越贵，
+  且「助手腔」会自我强化。达到阈值时自动新建会话，并把最近几轮压缩成一句话注入开场白，
+  保证接得上话又控制成本。
+
+### 6. 图片：占位不追尾
+
+QQ 图片消息在 AX 树里没有可读内容，桥接把它标记成 `[图片]` / `[表情包]`。
+`AGENTS.md` 里明确告诉模型：看不到内容，不要问「能发原图吗」，自然接话即可
+（比如「这啥啊」「笑死」）。这样至少不会崩人设。
 
 ### 效果对比
 
