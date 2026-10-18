@@ -1,10 +1,13 @@
 # 运行数据（含聊天内容、会话 ID、发送记录）—— 绝不上传
 data/
-qq-workspace/
 *.log
 
 # 本地配置（含个人备注名等）
 .env
+
+# QQ 会话工作目录：只保留人格设定，其余运行产物不上传
+qq-workspace/*
+!qq-workspace/AGENTS.md
 
 # Python
 __pycache__/

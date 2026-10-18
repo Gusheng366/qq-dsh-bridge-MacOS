@@ -32,6 +32,7 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 
 from dsh_api import DshApi
+from reply_style import clean_reply, split_messages
 
 # ----------------------------------------------------------------------------
 # 配置
@@ -85,6 +86,10 @@ READ_ONLY = os.environ.get("QQ_READ_ONLY", "0") == "1"
 TYPE_GUARD_MAX_WAIT_S = float(os.environ.get("QQ_TYPE_GUARD_MAX_WAIT", "90"))
 # 静默时段 "23:00-08:00"，留空则不启用
 QUIET_HOURS = os.environ.get("QQ_QUIET_HOURS", "").strip()
+# 拆条：单条最大字数
+SPLIT_MAX_CHARS = int(os.environ.get("QQ_SPLIT_MAX_CHARS", "60"))
+# 拆条后随机只回第一条的概率（模拟真人在忙）
+SHORT_REPLY_PROBABILITY = float(os.environ.get("QQ_SHORT_REPLY_PROB", "0.10"))
 
 # ----------------------------------------------------------------------------
 # Accessibility / CoreGraphics 绑定
@@ -465,59 +470,112 @@ def clear_input(pid: int) -> None:
     press_key(pid, DELETE_KEY, 0, 0.05)
 
 
-def send_reply(qq: "QQ", text: str) -> bool:
-    """短暂激活 QQ，写入并回车，然后还原原前台应用。"""
+def _send_one(qq: "QQ", text: str) -> bool:
+    """在 QQ 已激活、会话已打开的前提下，写入一条消息并回车。"""
+    qq.refresh()
+    box = qq.input_box()
+    if box is None:
+        log("找不到输入框", "ERROR")
+        return False
+
+    HIS.AXUIElementPerformAction(box, cs("AXPress"))
+    time.sleep(0.18)
+    clear_input(qq.pid)
+    time.sleep(0.12)
+    type_via_cg(qq.pid, text)
+    time.sleep(0.28)
+    press_key(qq.pid, 36)  # Return
+    time.sleep(0.35)
+
+    # 验证：输入框清空说明已发出
+    qq.refresh()
+    box2 = qq.input_box()
+    residual = (ax_str(box2, "AXValue") or "").strip()
+    if residual:
+        log(f"输入框仍有残留（{residual[:40]!r}），可能未发送", "WARN")
+        return False
+    return True
+
+
+def typing_delay(text: str, split_mode: bool = False) -> float:
+    """按字数估算「打字」耗时，带长尾随机。
+
+    基础 4~8 字/秒；多条之间的停顿较短，首次回复前的"读消息"时间较长。
+    """
+    chars = max(1, len(text))
+    # 4~8 字/秒
+    cps = random.uniform(4.0, 8.0)
+    base = chars / cps
+
+    if split_mode:
+        # 条与条之间：短一些，1~3 秒
+        delay = max(0.8, min(base, 3.0))
+        return random.uniform(delay * 0.6, delay * 1.3)
+
+    # 首次回复：加"看到消息 + 思考"的时间
+    delay = base + random.uniform(1.0, 3.0)
+    # 约 12% 概率故意慢一拍，像在忙别的事
+    if random.random() < 0.12:
+        delay += random.uniform(4.0, 10.0)
+    return min(delay, 15.0)
+
+
+def send_messages(qq: "QQ", parts: list[str]) -> list[str]:
+    """分多条发送，只在开头激活一次 QQ，末尾还原原前台应用。
+
+    返回实际发送成功的文本列表（供回环防护逐条记录）。
+    """
+    if not parts:
+        return []
+
     original = front_app()
-    if not qq.refresh():
-        log("发送前无法定位 QQ", "ERROR")
-        return False
+    sent: list[str] = []
 
-    item = qq.find_session_item(TARGET_REMARK)
-    if item is None:
-        log("发送前找不到目标会话", "ERROR")
-        return False
-    qq.open_session(item)
-    time.sleep(0.25)
-
-    # 激活 QQ（这一步会带来 1 秒左右的切屏）
-    activated = activate_app(qq.pid)
-    if not activated:
-        log("激活 QQ 失败", "ERROR")
-        return False
-    time.sleep(0.45)
-
-    ok = False
     try:
-        qq.refresh()
-        box = qq.input_box()
-        if box is None:
-            log("找不到输入框", "ERROR")
-        else:
-            HIS.AXUIElementPerformAction(box, cs("AXPress"))
-            time.sleep(0.2)
-            # 先清空可能残留的内容
-            clear_input(qq.pid)
-            time.sleep(0.15)
-            type_via_cg(qq.pid, text)
-            time.sleep(0.3)
-            press_key(qq.pid, 36)  # Return
-            time.sleep(0.4)
-            # 验证输入框是否清空（清空说明已发送）
-            qq.refresh()
-            box2 = qq.input_box()
-            residual = (ax_str(box2, "AXValue") or "").strip()
-            ok = residual == ""
-            if not ok:
-                log(f"输入框仍有残留（{residual[:40]!r}），可能未发送", "WARN")
+        if not qq.refresh():
+            log("发送前无法定位 QQ", "ERROR")
+            return []
+
+        item = qq.find_session_item(TARGET_REMARK)
+        if item is None:
+            log("发送前找不到目标会话", "ERROR")
+            return []
+        qq.open_session(item)
+        time.sleep(0.2)
+
+        # 只在需要发消息时激活一次
+        if not activate_app(qq.pid):
+            log("激活 QQ 失败", "ERROR")
+            return []
+        time.sleep(0.4)
+
+        for idx, part in enumerate(parts):
+            ok = _send_one(qq, part)
+            if ok:
+                sent.append(part)
+            else:
+                log(f"第 {idx + 1}/{len(parts)} 条发送失败", "ERROR")
+                if not sent:
+                    break
+
+            # 多条之间的模拟打字停顿（最后一条不等）
+            if idx < len(parts) - 1:
+                pause = typing_delay(part, split_mode=True)
+                log(f"  等待 {pause:.1f}s 后发送下一条")
+                time.sleep(pause)
     finally:
-        # 还原原前台应用
         if original:
             orig_name, orig_pid = original
             if orig_pid != qq.pid:
                 activate_app(orig_pid)
-                time.sleep(0.15)
+                time.sleep(0.12)
 
-    return ok
+    return sent
+
+
+def send_reply(qq: "QQ", text: str) -> bool:
+    """兼容旧接口：发送单条文本。"""
+    return bool(send_messages(qq, [text]))
 
 
 # ----------------------------------------------------------------------------
@@ -750,37 +808,58 @@ def main() -> int:
                     user_text = info["preview"].strip()
                 log(f"用户消息：{user_text[:100]!r}")
 
-                reply = ask_dsh(user_text, api, current_sid)
-                if not reply:
+                raw_reply = ask_dsh(user_text, api, current_sid)
+                if not raw_reply:
                     log("DSH 无输出", "WARN")
-                elif len(reply) > MAX_REPLY_CHARS:
-                    reply = reply[:MAX_REPLY_CHARS] + "…"
 
-                if reply and READ_ONLY:
+                # ── 输出层：清洗成聊天腔 ──
+                reply = clean_reply(raw_reply) if raw_reply else ""
+                if raw_reply and not reply:
+                    log(f"回复被清洗丢弃（含 AI 自曝或纯客套）：{raw_reply[:80]!r}", "WARN")
+                if not reply:
+                    pass  # 没有可发的内容
+                elif READ_ONLY:
                     log(f"[只读模式] 拟定回复：{reply[:200]!r}")
-                elif reply:
+                else:
                     if in_quiet_hours():
                         log("处于静默时段，暂不发送", "INFO")
                     elif not rate_ok(state):
                         log("达到每小时发送上限", "WARN")
                     else:
+                        # ── 节奏层：拆条 + 打字延迟 + 随机敷衍 ──
+                        parts = split_messages(reply, max_chars=SPLIT_MAX_CHARS)
+                        # 偶尔只回一个短词，像真人在忙
+                        if len(parts) > 1 and random.random() < SHORT_REPLY_PROBABILITY:
+                            parts = parts[:1]
+                            log("  随机触发：只回第一条")
+
                         wait_start = time.time()
                         while user_is_typing() and time.time() - wait_start < TYPE_GUARD_MAX_WAIT_S:
                             time.sleep(2)
                             if not _running:
                                 break
+
                         gap = random.uniform(SEND_GAP_MIN_S, SEND_GAP_MAX_S)
                         elapsed = time.time() - last_send_at
                         if elapsed < gap:
                             time.sleep(gap - elapsed)
-                        if send_reply(qq, reply):
+
+                        # 首条前的"读消息 + 思考"延迟
+                        think = typing_delay(parts[0]) if parts else 0.0
+                        log(f"  模拟打字 {think:.1f}s")
+                        time.sleep(think)
+
+                        sent_parts = send_messages(qq, parts)
+                        if sent_parts:
                             last_send_at = time.time()
                             state["send_times"].append(last_send_at)
-                            # 回环防护：记住自己刚发的文本（QQ 会把它当作会话预览）
-                            state.setdefault("own_sent", []).append(reply[:200])
-                            state["own_sent"] = state["own_sent"][-10:]
+                            # 回环防护：逐条记录自己发出的每一段
+                            own = state.setdefault("own_sent", [])
+                            own.extend(p[:200] for p in sent_parts)
+                            state["own_sent"] = own[-20:]
                             save_state(state)
-                            log(f"已回复：{reply[:100]!r}")
+                            for p in sent_parts:
+                                log(f"已发送：{p[:80]!r}")
                         else:
                             log("发送失败", "ERROR")
 
