@@ -1,15 +1,18 @@
 # 会话交接文档 · qq-dsh-bridge
 
-> 写于 2026-10-19 10:15。本文件把上一个会话的全部上下文压成一份可执行的状态记录，
+> 写于 2026-10-19 10:15，更新于 10:30。本文件把会话的全部上下文压成一份可执行的状态记录，
 > 新会话读它就能接着干，不必从头摸索。
->
-> **先读「三、当前已知 Bug」——项目现在处于「功能齐但有一个重复回复的缺陷」的状态。**
 
-**交接时的运行状态**：
+**交接时的运行状态（10:30）**：
 
-- 桥接进程：**已停止**（日志末尾是 `10:12:08 桥接已退出`）
-- 代码：能跑，但带第三节的 Bug 1
-- 未提交改动：有（见第四节），**未 push**
+- 桥接进程：**已停止**——**模型额度耗尽，用户要求先不调用**
+- `workbuddy / deepseek-v4.1-flash` 现在调用会返回空回复（额度用完）
+- `deepseek-official`（DeepSeek 官方 key）和 `workbuddy / hy3` 仍可用
+- 代码：Bug 1 已修；课程表已接入
+- 已本地提交到 `0befda3`，**未 push**（用户明确要求「我说推你再推」）
+
+> ⚠️ **重启桥接前先确认额度已恢复**，否则每条消息都会走一次失败的模型调用。
+> 验证方法见第十节「额度耗尽怎么判断」。
 
 ---
 
@@ -155,24 +158,25 @@ ps aux | grep "[b]ridge.py" | wc -l   # 应为 0
 
 ---
 
-## 四、当前未提交的改动（重要！）
+## 四、已提交的改动（**未推送**）
 
-`git status`：
+`git log`：
 
 ```
- M .env.example           # 新增 20 行配置项说明
- M bridge.py              # 改了约 250 行（见下）
- M qq-workspace/AGENTS.md # 新增日记/印象/图库/图片规则
- M reply_style.py         # 新增英文思考泄漏过滤
-?? qq_capture.py          # 新增：窗口截图工具
-?? vision.py              # 新增：图片理解
+0befda3  feat: 课程表接入，让聊天对象知道几号有课
+79ce04f  fix: 修复重复回复 bug，补齐图片理解与秒回节奏
+58cca8a  feat: 进阶 1 与 5 —— 日记、印象、图库、主动找人、时间感   ← 远程最新
 ```
 
-**上个会话结束时没有 commit，也没有 push。** 用户明确要求：
+`git status -sb` → `## main...origin/main [ahead 2]`
+
+**用户明确要求**：
 
 > 「不要自作主张直接推，我说推你再推」
 
-未提交改动包含这些新功能：
+两个未推送的提交包含：
+
+**`79ce04f` — Bug 1 修复 + 8 项能力**
 
 1. **英文思考泄漏过滤**（`reply_style.py: strip_reasoning()`）
    —— 模型偶尔把 `Hmm, but instruction says...` 这类思考混进正文发出
@@ -184,6 +188,12 @@ ps aux | grep "[b]ridge.py" | wc -l   # 应为 0
 6. **竞态重试**（`_send_one()` 带 3 次重试 + 每步确认 QQ 仍在前台）
 7. **待发队列**（发送失败 `stash_pending()`，下一轮优先补发）
 8. **检测修复**（每轮都读聊天记录 `read_chat_last_incoming()`，不依赖会话摘要刷新）
+
+**`0befda3` — 课程表**
+
+9. **课表导入**（`schedule_import.py`）：ICS 展开成扁平课表，只留今天及以后
+10. **课表注入**（`schedule.py`）：每轮附带约 250 字摘要（今天/明天/下次/本周）
+11. **人格规则**（`AGENTS.md`）：知道课表但不做日程助手
 
 ---
 
@@ -199,6 +209,8 @@ ps aux | grep "[b]ridge.py" | wc -l   # 应为 0
 | `diary.py` | 180 | 进阶 1：日记读写与解析 |
 | `vision.py` | 171 | 图片理解：截图调度、占位检测 |
 | `qq_capture.py` | 101 | 独立的截图探测脚本（可单独跑） |
+| `schedule_import.py` | ~330 | 课表导入器：ICS 展开成扁平课表（一次性/换课表时跑） |
+| `schedule.py` | ~160 | 课表运行时：读 schedule.json，生成约 250 字注入摘要 |
 | `启动桥接.command` | — | 双击启动 |
 | `停止桥接.command` | — | 双击停止 |
 | `README.md` | — | 对外文档（含技术选型依据） |
@@ -206,12 +218,26 @@ ps aux | grep "[b]ridge.py" | wc -l   # 应为 0
 | `.env.example` | — | 配置模板（**会提交**） |
 | `.env` | — | 本地配置（**已 gitignore，含 `QQ_TARGET=DSH-BOT`**） |
 | `qq-workspace/AGENTS.md` | — | **人格设定**（会提交，这是关键） |
+| `qq-workspace/课程表/schedule.json` | — | 课表数据（gitignore，由 schedule_import 生成） |
+| `qq-workspace/课程表/schedule.md` | — | 人读的课表（gitignore） |
+| `qq-workspace/课程表/未来课程.ics` | — | 清理后的日历文件，可导入手机（gitignore） |
 | `qq-workspace/日记/diary.jsonl` | — | 运行数据（gitignore） |
 | `qq-workspace/印象/*.json` | — | 运行数据（gitignore） |
 | `qq-workspace/截图/*.png` | — | 运行数据（gitignore） |
 | `data/bridge.log` | — | 运行日志（gitignore） |
 | `data/state.json` | — | 状态机（gitignore） |
 | `data/dsh-session.txt` | — | 绑定的 DSH 会话 ID（gitignore） |
+
+### 课表怎么更新
+
+换学期或课表有变时，重新跑一次导入器即可（会覆盖 `qq-workspace/课程表/`）：
+
+```bash
+cd "/Users/gusheng/Documents/deepseek-harness/默认工作区/qq-dsh-bridge"
+python3 schedule_import.py <新课程表.ics>
+```
+
+桥接会按文件 mtime 自动重载，**不用重启**。
 
 ---
 
@@ -408,7 +434,7 @@ QQ 是 Chromium 系，AX 树完整。实测可靠的定位方式：
 | 症状 | 真因 | 处理 |
 |---|---|---|
 | 消息很久不回复 | **会话列表摘要不刷新**，`sig` 永远不变 | 已修：每轮读 `read_chat_last_incoming()` |
-| 同一条消息回好几遍 | `deep` 在渲染滞后时还是旧值 | **见第三节 Bug 1，待修** |
+| 同一条消息回好几遍 | `deep` 在渲染滞后时还是旧值 | ✅ 已修，见第三节 |
 | 回复慢 90 秒 | 旧 `user_is_typing()` 只要焦点在输入框就判「在忙」 | 已修：改用 IOKit `HIDIdleTime` |
 | 发送失败丢消息 | 用户点屏幕抢走焦点 | 已修：重试 + `_qq_is_frontmost()` + 待发队列 |
 | 报「另一个实例已在运行」 | 残留锁文件 + 僵尸进程 | `kill -9` 所有进程 + 删 `data/bridge.lock` |
@@ -417,30 +443,79 @@ QQ 是 Chromium 系，AX 树完整。实测可靠的定位方式：
 | AX 树是空的 | 没开 `AXManualAccessibility` | `qq.refresh()` 里已处理 |
 | 人格设定不生效 | `AGENTS.md` 只在会话**首次请求**时加载 | 删 `data/dsh-session.txt` 后重启 |
 | 模型 selectModel 失败 | 只传了 `reasoningEffort` 没传 provider/model | 用 `resolve_model()` 先取现有值 |
+| **模型不回复、turn 里 response 为空** | **模型额度耗尽**（本次就是） | 见下方「额度耗尽怎么判断」 |
+
+### 额度耗尽怎么判断
+
+**症状**：`session/prompt` 返回 `ok: True`（投递成功），但 `turnOutline[-1].response`
+永远是空串，`inbox` 也为空，`sessionStats.llmMs = 0`、`decodeTokens = 0`。
+会话 `running: False`，看起来「跑完了」，其实 LLM 一次都没真正调用成功。
+
+**判断脚本**（不依赖 QQ，纯测 DSH）：
+
+```bash
+cd "/Users/gusheng/Documents/deepseek-harness/默认工作区/qq-dsh-bridge"
+python3 - <<'PY'
+import sys, uuid, time; sys.path.insert(0,'.')
+import bridge as B
+api = B.DshApi(B.DSH_BASE_URL)
+st, d = api.rpc('session/create', {'request': {'cwd': str(B.QQ_SESSION_CWD)}})
+sid = d['result']['value']['sessionId']
+api.rpc('session/selectModel', {'request': {
+    'sessionId': sid, 'provider': 'workbuddy',
+    'model': 'deepseek-v4.1-flash', 'reasoningEffort': 'low'}})
+api.rpc('session/prompt', {'request': {
+    "sessionId": sid, "requestId": str(uuid.uuid4()), "mode": "queue",
+    "content": [{"type": "text", "text": "只回复两个字：测试"}]}})
+for i in range(30):
+    time.sleep(2)
+    st, d = api.rpc('session/projections', {'request': {'sessionId': sid}})
+    o = d['result']['value']['values'].get('turnOutline', [])
+    if o and o[-1].get('response'):
+        print("✅ 额度正常:", o[-1]['response']); break
+else:
+    print("❌ 额度耗尽或无响应")
+PY
+```
+
+**2026-10-19 10:30 的实测结论**：
+
+| provider / model | 状态 |
+|---|---|
+| `workbuddy / deepseek-v4.1-flash` | ❌ 额度用完，无回复 |
+| `workbuddy / hy3` | ✅ 可用（限时免费） |
+| `deepseek-official / deepseek-flash` | ✅ 可用（走 DeepSeek 官方 key，有 ¥11.79 余额） |
+
+用户选择：**先不调用，等充值后再启动**。恢复后直接 `python3 bridge.py` 即可，
+不需要改任何配置（默认还是 workbuddy / deepseek-v4.1-flash）。
 
 ---
 
 ## 十一、用户的明确偏好（务必遵守）
 
 1. **不要自作主张 push**：「我说推你再推」
-2. **不换模型**：就用 `workbuddy / deepseek-v4.1-flash`
+2. **不换模型**：就用 `workbuddy / deepseek-v4.1-flash`（额度用完时宁可停着，也别偷偷换）
 3. **要快**：回复控制在 15 秒内，砍掉多余的「打字模拟」
 4. **不抢控制权**：用户打字/动鼠标时不发，等停下再发
 5. **要能看懂图片/表情包**：不能只会装傻
 6. **越像真人越好**：不要助手腔、不要分点、不要总结
 7. **限制发送频率**：每分钟不超过 20 条（QQ 服务端硬限制，超了会被整段限速）
+8. **额度用完就先停**：不要自动降级到别的模型去烧别的额度
 
 ---
 
 ## 十二、下一步待办（按优先级）
 
+**当前阻塞**：模型额度耗尽，桥接已停。用户会稍后充值。
+
 1. ~~修 Bug 1（重复回复）~~ —— ✅ **已完成**，见第三节
-2. **实机回归**：让用户发一条消息，确认只回复一次、且延迟在 15 秒内
-3. **验证 Bug 3**（`_SkipSend` 后消息是否会丢）—— 逻辑上已随 Bug 1 一并修好，需实测
-4. **跑一轮完整回归**：发文字、发图片、打字时发、连续发多条
-5. **提交本轮全部改动**（8 项新功能 + Bug 1 修复），等用户说「推」再 push
-6. **补文档**：README 里补「秒回模式」「不抢控制权」「图片理解」三节
-7. 可选：`app not frontmost` 时的截图兜底（现在截图要求窗口可见）
+2. **等额度恢复**：先跑第十节的判断脚本确认能出字
+3. **实机回归**：让用户发一条消息，确认只回复一次、延迟在 15 秒内
+4. **验证 Bug 3**（`_SkipSend` 后消息是否会丢）—— 逻辑上已随 Bug 1 一并修好，需实测
+5. **跑一轮完整回归**：发文字、发图片、打字时发、连续发多条、问「我明天有课吗」
+6. **提交**：已有两个本地提交（`79ce04f`、`0befda3`），等用户说「推」再 push
+7. **补文档**：README 里补「秒回模式」「不抢控制权」「图片理解」「课程表」四节
+8. 可选：`app not frontmost` 时的截图兜底（现在截图要求窗口可见）
 
 ---
 
@@ -448,4 +523,5 @@ QQ 是 Chromium 系，AX 树完整。实测可靠的定位方式：
 
 1. **别再去试协议端和「无焦点发送」**——已穷尽验证，macOS 上不可能，理由写在 7.2。
 2. **改动前先看第七节**，尤其 AX 定位方式和 DSH API 的 args 包装字段名的坑。
-3. **Bug 1（重复回复）已修**，当前最该做的是实机回归验证，而不是继续加功能。
+3. **Bug 1 已修、课表已接入，但现在模型额度耗尽、桥接是停的**——
+   先确认额度，再谈回归和加功能。
