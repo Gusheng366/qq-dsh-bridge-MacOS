@@ -220,21 +220,20 @@ def parse_gallery_from_reply(reply: str) -> tuple[str, dict | None]:
 class Proactive:
     """主动找人聊天的调度器。
 
-    参数（文档参考值）：
-      开关            开
-      多久检查一次     45 ~ 110 分钟（随机）
-      安静多久才考虑    15 分钟
-      每次真发的概率    0.35
-      深夜打折         不打折
+    当前策略（用户指定）：**距上一次消息 10~40 分钟后主动找他**。
+      - 每收到/发出一條消息，都把下一次主动发言推到「现在 + 10~40 分钟随机」
+      - 到点时若仍然安静，就直接发（概率 1.0，不再掷骰子，
+        否则可能拖到 80 分钟，超出用户预期）
+      - 模型仍可以用 SILENT 表示这次不想说
     """
 
     def __init__(
         self,
         enabled: bool = True,
-        check_min_minutes: float = 45,
-        check_max_minutes: float = 110,
-        idle_minutes: float = 15,
-        probability: float = 0.35,
+        check_min_minutes: float = 10,
+        check_max_minutes: float = 40,
+        idle_minutes: float = 10,
+        probability: float = 1.0,
         quiet_hours: str = "",
     ):
         self.enabled = enabled
@@ -247,6 +246,22 @@ class Proactive:
 
     def _schedule_next(self, now_ts: float) -> None:
         self._next_check_at = now_ts + random.uniform(self.check_min, self.check_max)
+
+    def note_activity(self, now_ts: float) -> None:
+        """有消息往来时调用：把下一次主动发言推到 10~40 分钟后。
+
+        这样「上一次说话 → 主动找你」的间隔就落在 10~40 分钟，
+        不会被固定的检查周期拖到一小时以上。
+        """
+        if not self.enabled:
+            return
+        self._schedule_next(now_ts)
+
+    def minutes_until_next(self, now_ts: float) -> float:
+        """距离下一次主动发言还有多少分钟（用于日志/调试）。"""
+        if self._next_check_at <= 0:
+            return 0.0
+        return max(0.0, (self._next_check_at - now_ts) / 60.0)
 
     def _in_quiet(self, now: datetime) -> bool:
         if not self.quiet_hours:

@@ -146,10 +146,10 @@ DIARY_MAX_PER_DAY = int(os.environ.get("QQ_DIARY_MAX_PER_DAY", "3"))
 
 # ── 进阶 5：主动找人 ──────────────────────────────
 PROACTIVE_ENABLED = os.environ.get("QQ_PROACTIVE_ENABLED", "1") == "1"
-PROACTIVE_CHECK_MIN = float(os.environ.get("QQ_PROACTIVE_CHECK_MIN", "45"))
-PROACTIVE_CHECK_MAX = float(os.environ.get("QQ_PROACTIVE_CHECK_MAX", "110"))
-PROACTIVE_IDLE_MINUTES = float(os.environ.get("QQ_PROACTIVE_IDLE_MIN", "15"))
-PROACTIVE_PROBABILITY = float(os.environ.get("QQ_PROACTIVE_PROB", "0.35"))
+PROACTIVE_CHECK_MIN = float(os.environ.get("QQ_PROACTIVE_CHECK_MIN", "10"))
+PROACTIVE_CHECK_MAX = float(os.environ.get("QQ_PROACTIVE_CHECK_MAX", "40"))
+PROACTIVE_IDLE_MINUTES = float(os.environ.get("QQ_PROACTIVE_IDLE_MIN", "10"))
+PROACTIVE_PROBABILITY = float(os.environ.get("QQ_PROACTIVE_PROB", "1.0"))
 
 # ── 进阶 5：印象与图库 ────────────────────────────
 IMPRESSIONS_ENABLED = os.environ.get("QQ_IMPRESSIONS_ENABLED", "1") == "1"
@@ -1600,8 +1600,8 @@ def main() -> int:
         log(f"日记已开启（今日 {diary.count_today()}/{DIARY_MAX_PER_DAY}）")
     if PROACTIVE_ENABLED:
         log(
-            f"主动找已开启（每 {PROACTIVE_CHECK_MIN:.0f}~{PROACTIVE_CHECK_MAX:.0f} 分钟检查，"
-            f"安静 {PROACTIVE_IDLE_MINUTES:.0f} 分钟后才有概率发，概率 {PROACTIVE_PROBABILITY}）"
+            f"主动找已开启（距上次消息 {PROACTIVE_CHECK_MIN:.0f}~{PROACTIVE_CHECK_MAX:.0f} "
+            f"分钟后主动发一条；概率 {PROACTIVE_PROBABILITY}）"
         )
 
     while _running:
@@ -1825,6 +1825,7 @@ def main() -> int:
 
                 log(f"  投递上下文 {len(prompt_text)} 字符")
                 last_activity_ts = time.time()
+                proactive.note_activity(last_activity_ts)
 
                 # ── 第 8 项：轮数超限则滚动会话 ──
                 try:
