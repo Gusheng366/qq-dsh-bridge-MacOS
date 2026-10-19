@@ -85,18 +85,32 @@ class Schedule:
 
     # ── 摘要 ──────────────────────────────────────
     @staticmethod
-    def _fmt_class(c: dict, now: datetime | None = None, mark_state: bool = False) -> str:
-        base = f"{c['start']} {c['name']}"
+    def _fmt_class(c: dict) -> str:
+        """一行课的骨架：10:00-11:40 广域承载网架构与技术（明辨楼406）。"""
+        base = f"{c.get('start', '')}-{c.get('end', '')} {c.get('name', '')}"
         if c.get("room"):
             base += f"（{c['room']}）"
-        if mark_state and now is not None:
-            try:
-                end = datetime.strptime(f"{c['date']} {c['end']}", "%Y-%m-%d %H:%M")
-                if end < now:
-                    base += "·已上完"
-            except (KeyError, ValueError):
-                pass
         return base
+
+    @staticmethod
+    def _state_of(c: dict, now: datetime) -> str:
+        """这一节相对「现在」的状态。
+
+        必须把「下课时间」讲清楚——否则模型会拿后面那节课的时间当现在，
+        例如上午还在上课却回成下午的下课时间。
+        """
+        try:
+            start = datetime.strptime(f"{c['date']} {c['start']}", "%Y-%m-%d %H:%M")
+            end = datetime.strptime(f"{c['date']} {c['end']}", "%Y-%m-%d %H:%M")
+        except (KeyError, ValueError):
+            return ""
+        if now >= end:
+            return "已下课"
+        if start <= now < end:
+            left = int((end - now).total_seconds() // 60)
+            hint = f"（还有 {left} 分钟）" if left > 0 else ""
+            return f"★正在上，{c['end']} 下课{hint}"
+        return "还没开始"
 
     def prompt_snippet(self, now: datetime | None = None) -> str:
         """生成注入到对话里的课表摘要。没有数据时返回空串。"""
@@ -105,13 +119,20 @@ class Schedule:
         now = now or datetime.now()
         today = now.date()
 
-        lines: list[str] = []
+        lines: list[str] = [f"现在 {now:%H:%M}"]
 
         # 今天
         todays = self.classes_on(today)
         if todays:
-            items = "、".join(self._fmt_class(c, now, mark_state=True) for c in todays)
-            lines.append(f"今天{len(todays)}节：{items}")
+            lines.append(
+                f"今天（{today.month}月{today.day}日 {WEEKDAYS[today.weekday()]}）{len(todays)}节："
+            )
+            for c in todays:
+                state = self._state_of(c, now)
+                item = "  " + self._fmt_class(c)
+                if state:
+                    item += f" —— {state}"
+                lines.append(item)
         else:
             lines.append("今天没课")
 
@@ -119,16 +140,23 @@ class Schedule:
         tomorrow = today + timedelta(days=1)
         tmr = self.classes_on(tomorrow)
         if tmr:
-            items = "、".join(self._fmt_class(c) for c in tmr)
-            lines.append(f"明天{len(tmr)}节：{items}")
+            lines.append(
+                f"明天（{tomorrow.month}月{tomorrow.day}日 {WEEKDAYS[tomorrow.weekday()]}）{len(tmr)}节："
+            )
+            for c in tmr:
+                lines.append("  " + self._fmt_class(c))
 
         # 下次上课
         nxt = self.next_class(now)
         if nxt:
             d = datetime.strptime(nxt["date"], "%Y-%m-%d")
             delta = (d.date() - today).days
-            when = "今天" if delta == 0 else ("明天" if delta == 1 else f"{d.month}月{d.day}日{WEEKDAYS[d.weekday()]}")
-            lines.append(f"下次上课：{when} {nxt['start']} {nxt['name']}")
+            when = (
+                "今天"
+                if delta == 0
+                else ("明天" if delta == 1 else f"{d.month}月{d.day}日{WEEKDAYS[d.weekday()]}")
+            )
+            lines.append(f"下一节：{when} {nxt['start']}-{nxt['end']} {nxt['name']}")
         elif not todays and not tmr:
             lines.append("近期没有课了")
 
@@ -145,6 +173,7 @@ class Schedule:
         return (
             "【课表】\n"
             + "\n".join(lines)
-            + "\n你知道这些安排，可以自然地提（比如「你下午还有课吧」），"
-            "但不要像日程助手那样汇报，也别主动念整张表。"
+            + "\n★几条规矩：每节课都有开始和下课时间；说「现在」时要看清哪一节"
+            "正在上（★标记）、几点下课，不要把后面那节的时间当成现在。"
+            "这些你心里有数就行，别像日程助手那样汇报，也别主动念整张表。"
         )
