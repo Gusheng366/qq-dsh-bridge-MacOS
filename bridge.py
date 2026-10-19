@@ -166,7 +166,9 @@ TYPING_DELAY_MAX_S = float(os.environ.get("QQ_TYPING_DELAY_MAX", "0.3"))
 SLOW_REPLY_PROBABILITY = float(os.environ.get("QQ_SLOW_REPLY_PROB", "0.05"))
 SLOW_REPLY_MAX_S = float(os.environ.get("QQ_SLOW_REPLY_MAX", "6"))
 
-# 打字保护：系统空闲时间低于这个秒数才算「你在用电脑」
+# 等待策略：mouse=只看鼠标（默认，键盘在敲不影响）；any=键鼠都算
+IDLE_SOURCE = os.environ.get("QQ_IDLE_SOURCE", "mouse").strip().lower() or "mouse"
+# 空闲时间低于这个秒数才算「你正在操作」
 TYPING_IDLE_THRESHOLD_S = float(os.environ.get("QQ_TYPING_IDLE_SEC", "3"))
 # 打字保护最多等多久
 TYPING_GUARD_MAX_WAIT_S = float(os.environ.get("QQ_TYPE_GUARD_MAX_WAIT", "20"))
@@ -439,13 +441,61 @@ def system_idle_seconds() -> float:
     return 0.0
 
 
+# 鼠标相关事件类型（CGEventType）
+_MOUSE_EVENT_TYPES = (
+    1,   # kCGEventLeftMouseDown
+    2,   # kCGEventLeftMouseUp
+    3,   # kCGEventRightMouseDown
+    4,   # kCGEventRightMouseUp
+    5,   # kCGEventMouseMoved
+    6,   # kCGEventLeftMouseDragged
+    7,   # kCGEventRightMouseDragged
+    22,  # kCGEventScrollWheel
+)
+_kCGEventSourceStateHIDSystemState = 1
+
+
+def mouse_idle_seconds() -> float:
+    """只统计鼠标的空闲秒数（不看键盘）。
+
+    键盘一直在敲不影响这个值——按用户的设定，只要鼠标没动就可以操作。
+    """
+    try:
+        CG.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+        CG.CGEventSourceSecondsSinceLastEventType.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        values = []
+        for evt in _MOUSE_EVENT_TYPES:
+            try:
+                v = CG.CGEventSourceSecondsSinceLastEventType(
+                    _kCGEventSourceStateHIDSystemState, evt
+                )
+            except Exception:
+                continue
+            if v is not None and v >= 0:
+                values.append(float(v))
+        return min(values) if values else 0.0
+    except Exception:
+        # 退回到「任意输入」的空闲时间
+        return system_idle_seconds()
+
+
+def current_idle_seconds() -> float:
+    """按配置选择用「只看鼠标」还是「键鼠都算」。"""
+    if IDLE_SOURCE == "mouse":
+        return mouse_idle_seconds()
+    return system_idle_seconds()
+
+
 def user_is_typing(idle_threshold: float = 0.0) -> bool:
     """在「发送会打断你」的意义上，用户是否正在忙。
 
     只看系统空闲时间：最近几秒内有键入/鼠标移动才算忙。
     """
     threshold = idle_threshold if idle_threshold > 0 else TYPING_IDLE_THRESHOLD_S
-    return system_idle_seconds() < threshold
+    return current_idle_seconds() < threshold
 
 
 def wait_until_user_idle(max_wait: float = 0.0) -> tuple[bool, float]:
@@ -460,14 +510,14 @@ def wait_until_user_idle(max_wait: float = 0.0) -> tuple[bool, float]:
     started = time.time()
     announced = False
     while _running:
-        idle = system_idle_seconds()
+        idle = current_idle_seconds()
         if idle >= TYPING_IDLE_THRESHOLD_S:
             waited = time.time() - started
             if waited > 0.5:
-                log(f"  你在忙，已等待 {waited:.1f}s，现在空闲了，立即发送")
+                log(f"  鼠标已停 {idle:.0f}s，立即发送（等了 {waited:.1f}s）")
             return True, waited
         if not announced:
-            log("  检测到你正在用电脑，等你不操作了再发", "INFO")
+            log("  你正在动鼠标，等你停下来再发", "INFO")
             announced = True
         if max_wait > 0 and time.time() - started >= max_wait:
             log(f"  等待超时（{max_wait:.0f}s），仍在你操作中，放弃本次发送", "WARN")
