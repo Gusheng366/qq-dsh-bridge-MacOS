@@ -24,6 +24,7 @@ import random
 import re
 import signal
 import subprocess
+import threading
 import uuid
 
 import sys
@@ -126,6 +127,8 @@ MODEL_PROBE_TIMEOUT = float(os.environ.get("QQ_MODEL_PROBE_TIMEOUT", "20"))
 MODEL_HEALTH_OK_TTL = float(os.environ.get("QQ_MODEL_HEALTH_OK_TTL", "600"))
 # 探测失败后多久内不再试它（秒）；过了就用主模型再试一次
 MODEL_HEALTH_FAIL_TTL = float(os.environ.get("QQ_MODEL_HEALTH_FAIL_TTL", "600"))
+# 后台多久复检一次主模型（秒），用于额度恢复后自动切回
+MODEL_REFRESH_INTERVAL_S = float(os.environ.get("QQ_MODEL_REFRESH_INTERVAL", "90"))
 
 # 多久没检测到变化就轻点一下会话项，促使 QQ 重绘 AX 树（秒）
 AX_POKE_AFTER_S = float(os.environ.get("QQ_AX_POKE_AFTER", "45"))
@@ -166,7 +169,7 @@ SLOW_REPLY_MAX_S = float(os.environ.get("QQ_SLOW_REPLY_MAX", "6"))
 # 打字保护：系统空闲时间低于这个秒数才算「你在用电脑」
 TYPING_IDLE_THRESHOLD_S = float(os.environ.get("QQ_TYPING_IDLE_SEC", "3"))
 # 打字保护最多等多久
-TYPING_GUARD_MAX_WAIT_S = float(os.environ.get("QQ_TYPE_GUARD_MAX_WAIT", "180"))
+TYPING_GUARD_MAX_WAIT_S = float(os.environ.get("QQ_TYPE_GUARD_MAX_WAIT", "20"))
 
 # ── 课程表 ────────────────────────────────────────
 SCHEDULE_ENABLED = os.environ.get("QQ_SCHEDULE_ENABLED", "1") == "1"
@@ -1207,6 +1210,14 @@ def pick_working_model(
     health = state.setdefault("model_health", {})
     now = time.time()
 
+    # ── 快路径：只用「缓存里确认可用」的模型，零探测延迟 ──
+    # 否则每次缓存过期都要白等一次 20s 探测，回复就会被拖慢。
+    for item in MODEL_CHAIN:
+        provider, model, _effort = item
+        rec = health.get(f"{provider}/{model}") or {}
+        if rec.get("ok") is True and now - float(rec.get("at") or 0) < MODEL_HEALTH_OK_TTL:
+            return item
+
     try:
         probe_sid = ensure_probe_session(api, state)
     except Exception as exc:  # noqa: BLE001
@@ -1243,6 +1254,42 @@ def pick_working_model(
 
     log("模型链里所有模型都不可用", "ERROR")
     return None
+
+
+def start_health_refresher(api: "DshApi", state: dict) -> None:
+    """后台线程：定期重新探测链首（主模型），让它恢复后能被自动切回。
+
+    必须放后台——同步探测一次要 20 秒，会把回复拖慢。
+    """
+
+    def loop() -> None:
+        while _running:
+            time.sleep(MODEL_REFRESH_INTERVAL_S)
+            if not _running:
+                break
+            try:
+                if not MODEL_CHAIN:
+                    continue
+                provider, model, _effort = MODEL_CHAIN[0]
+                key = f"{provider}/{model}"
+                rec = state.get("model_health", {}).get(key) or {}
+                # 只在「之前判定失败 且 已经过了冷却」时重探
+                if rec.get("ok") is not False:
+                    continue
+                if time.time() - float(rec.get("at") or 0) < MODEL_HEALTH_FAIL_TTL:
+                    continue
+                sid = ensure_probe_session(api, state)
+                good = probe_model(api, MODEL_CHAIN[0], sid, MODEL_PROBE_TIMEOUT)
+                state.setdefault("model_health", {})[key] = {
+                    "ok": good,
+                    "at": time.time(),
+                }
+                save_state(state)
+                log(f"后台复检主模型 {key}：{'已恢复' if good else '仍不可用'}")
+            except Exception as exc:  # noqa: BLE001
+                log(f"后台健康检查异常：{exc}", "WARN")
+
+    threading.Thread(target=loop, name="health-refresher", daemon=True).start()
 
 
 def mark_model_bad(state: dict, model: tuple[str, str, str]) -> None:
@@ -1473,6 +1520,7 @@ def main() -> int:
     if MODEL_CHAIN:
         desc = " → ".join(f"{p}/{m}" for p, m, _ in MODEL_CHAIN)
         log(f"模型链: {desc}")
+        start_health_refresher(api, state)
         log(f"  探测超时 {MODEL_PROBE_TIMEOUT:.0f}s，成功缓存 {MODEL_HEALTH_OK_TTL:.0f}s，"
             f"失败冷却 {MODEL_HEALTH_FAIL_TTL:.0f}s")
     else:
