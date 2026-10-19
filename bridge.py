@@ -32,7 +32,16 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 
 from dsh_api import DshApi
+from companion import (
+    Gallery,
+    Impressions,
+    Proactive,
+    parse_gallery_from_reply,
+    parse_impression_from_reply,
+    time_feel,
+)
 from context_builder import build_context_message
+from diary import Diary, parse_diary_from_reply
 from reply_style import clean_reply, split_messages
 
 # ----------------------------------------------------------------------------
@@ -97,6 +106,21 @@ REASONING_EFFORT = os.environ.get("QQ_REASONING_EFFORT", "low").strip()
 MAX_SESSION_TURNS = int(os.environ.get("QQ_MAX_SESSION_TURNS", "40"))
 # 投递时附带的历史消息条数
 CONTEXT_HISTORY = int(os.environ.get("QQ_CONTEXT_HISTORY", "6"))
+
+# ── 进阶 1：日记 ──────────────────────────────────
+DIARY_ENABLED = os.environ.get("QQ_DIARY_ENABLED", "1") == "1"
+DIARY_MAX_PER_DAY = int(os.environ.get("QQ_DIARY_MAX_PER_DAY", "3"))
+
+# ── 进阶 5：主动找人 ──────────────────────────────
+PROACTIVE_ENABLED = os.environ.get("QQ_PROACTIVE_ENABLED", "1") == "1"
+PROACTIVE_CHECK_MIN = float(os.environ.get("QQ_PROACTIVE_CHECK_MIN", "45"))
+PROACTIVE_CHECK_MAX = float(os.environ.get("QQ_PROACTIVE_CHECK_MAX", "110"))
+PROACTIVE_IDLE_MINUTES = float(os.environ.get("QQ_PROACTIVE_IDLE_MIN", "15"))
+PROACTIVE_PROBABILITY = float(os.environ.get("QQ_PROACTIVE_PROB", "0.35"))
+
+# ── 进阶 5：印象与图库 ────────────────────────────
+IMPRESSIONS_ENABLED = os.environ.get("QQ_IMPRESSIONS_ENABLED", "1") == "1"
+GALLERY_ENABLED = os.environ.get("QQ_GALLERY_ENABLED", "1") == "1"
 
 # ----------------------------------------------------------------------------
 # Accessibility / CoreGraphics 绑定
@@ -938,6 +962,27 @@ def main() -> int:
     last_send_at = 0.0
     miss_count = 0
 
+    # ── 进阶组件 ──
+    diary = Diary(QQ_SESSION_CWD, DIARY_MAX_PER_DAY) if DIARY_ENABLED else None
+    impressions = Impressions(QQ_SESSION_CWD, TARGET_REMARK) if IMPRESSIONS_ENABLED else None
+    gallery = Gallery(QQ_SESSION_CWD) if GALLERY_ENABLED else None
+    proactive = Proactive(
+        enabled=PROACTIVE_ENABLED,
+        check_min_minutes=PROACTIVE_CHECK_MIN,
+        check_max_minutes=PROACTIVE_CHECK_MAX,
+        idle_minutes=PROACTIVE_IDLE_MINUTES,
+        probability=PROACTIVE_PROBABILITY,
+        quiet_hours=QUIET_HOURS,
+    )
+    last_activity_ts = time.time()
+    if DIARY_ENABLED:
+        log(f"日记已开启（今日 {diary.count_today()}/{DIARY_MAX_PER_DAY}）")
+    if PROACTIVE_ENABLED:
+        log(
+            f"主动找已开启（每 {PROACTIVE_CHECK_MIN:.0f}~{PROACTIVE_CHECK_MAX:.0f} 分钟检查，"
+            f"安静 {PROACTIVE_IDLE_MINUTES:.0f} 分钟后才有概率发，概率 {PROACTIVE_PROBABILITY}）"
+        )
+
     while _running:
         try:
             if not qq.refresh():
@@ -1008,7 +1053,30 @@ def main() -> int:
                     partner_name=TARGET_REMARK,
                     history_limit=CONTEXT_HISTORY,
                 )
+
+                # ── 进阶 5④ 时间感 + ② 印象 + ③ 图库 + ① 日记 ──
+                extras: list[str] = []
+                extras.append(
+                    "【时间感】" + time_feel(datetime.fromtimestamp(last_activity_ts))
+                )
+                if impressions:
+                    snippet = impressions.prompt_snippet()
+                    if snippet:
+                        extras.append(snippet)
+                if gallery:
+                    gal = gallery.format()
+                    if gal:
+                        extras.append("【你的图库】\n" + gal)
+                if diary:
+                    snippet = diary.diary_prompt_snippet()
+                    if snippet:
+                        extras.append(snippet)
+
+                if extras:
+                    prompt_text = prompt_text + "\n\n" + "\n\n".join(extras)
+
                 log(f"  投递上下文 {len(prompt_text)} 字符")
+                last_activity_ts = time.time()
 
                 # ── 第 8 项：轮数超限则滚动会话 ──
                 try:
@@ -1021,6 +1089,27 @@ def main() -> int:
                 raw_reply = ask_dsh(prompt_text, api, current_sid)
                 if not raw_reply:
                     log("DSH 无输出", "WARN")
+
+                # ── 从回复里提取日记 / 印象 / 图库动作 ──
+                if raw_reply:
+                    if diary:
+                        raw_reply, diary_entry = parse_diary_from_reply(raw_reply)
+                        if diary_entry:
+                            saved = diary.append(diary_entry["content"], diary_entry["mood"])
+                            if saved:
+                                log(f"📔 她写了一条日记：{saved['内容'][:60]!r}")
+                            else:
+                                log("日记写入跳过（超出当日上限或内容为空）", "WARN")
+                    if impressions:
+                        raw_reply, traits = parse_impression_from_reply(raw_reply)
+                        if traits:
+                            impressions.save(traits)
+                            log(f"💭 印象已更新：{'、'.join(traits)}")
+                    if gallery:
+                        raw_reply, gal_entry = parse_gallery_from_reply(raw_reply)
+                        if gal_entry:
+                            gallery.add(gal_entry["title"], gal_entry["reason"])
+                            log(f"🖼 图库新增：{gal_entry['title']!r}")
 
                 # ── 输出层：清洗成聊天腔 ──
                 reply = clean_reply(raw_reply) if raw_reply else ""
@@ -1072,6 +1161,62 @@ def main() -> int:
                                 log(f"已发送：{p[:80]!r}")
                         else:
                             log("发送失败", "ERROR")
+
+            # ── 进阶 5① 主动找人（只在没有新消息可处理时） ──
+            if (
+                proactive.enabled
+                and _running
+                and rate_ok(state)
+                and not in_quiet_hours()
+            ):
+                try:
+                    if proactive.should_fire(
+                        time.time(), last_activity_ts, partner_is_typing=user_is_typing()
+                    ):
+                        log("触发主动发言检查")
+                        tid = time_feel(datetime.fromtimestamp(last_activity_ts))
+                        parts_prompt = [f"【时间感】{tid}"]
+                        if diary and diary.format_recent(3):
+                            parts_prompt.append("【最近日记】\n" + diary.format_recent(3))
+                        if impressions:
+                            snippet = impressions.prompt_snippet()
+                            if snippet:
+                                parts_prompt.append(snippet)
+                        parts_prompt.append(proactive.prompt_snippet())
+                        ask_text = "\n\n".join(parts_prompt)
+
+                        proactive_reply = ask_dsh(ask_text, api, current_sid)
+                        cleaned = clean_reply(proactive_reply) if proactive_reply else ""
+
+                        if not cleaned or "SILENT" in (proactive_reply or "").upper():
+                            log("她决定不说话")
+                        else:
+                            msg_parts = split_messages(cleaned, max_chars=SPLIT_MAX_CHARS)
+                            if random.random() < SHORT_REPLY_PROBABILITY and len(msg_parts) > 1:
+                                msg_parts = msg_parts[:1]
+                            time.sleep(typing_delay(msg_parts[0]) if msg_parts else 0)
+                            sent = send_messages(qq, msg_parts)
+                            if sent:
+                                last_send_at = time.time()
+                                last_activity_ts = last_send_at
+                                state["send_times"].append(last_send_at)
+                                own_list = state.setdefault("own_sent", [])
+                                own_list.extend(p[:200] for p in sent)
+                                state["own_sent"] = own_list[-20:]
+                                # 主动发言后，预览会变成自己发的内容，同步签名避免被当成新消息
+                                time.sleep(1.0)
+                                qq.refresh()
+                                it2 = qq.find_session_item(TARGET_REMARK)
+                                if it2 is not None:
+                                    info2 = qq.session_info(it2)
+                                    state["last_sig"] = f"{info2['time']}|{info2['preview']}"
+                                save_state(state)
+                                for p in sent:
+                                    log(f"主动发送：{p[:80]!r}")
+                            else:
+                                log("主动发送失败", "ERROR")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"主动发言异常：{type(exc).__name__}: {exc}", "ERROR")
 
         except Exception as exc:  # noqa: BLE001
             log(f"循环异常：{type(exc).__name__}: {exc}", "ERROR")
