@@ -107,6 +107,68 @@ def strip_polite(text: str) -> str:
     return s
 
 
+# ── 推理泄漏（思考草稿混进正文）────────────────────────────
+# 表现：中文回复后面紧跟一大段英文思考，或出现自我对话痕迹：
+#   "我哪看得见图 就一个占位 Hmm, but instruction says don't say ..."
+_REASONING_MARKERS = re.compile(
+    r"(?i)"
+    r"\b(?:hmm+|wait|actually|let me|i should|i need to|i think|"
+    r"instruction says|the instruction|but instruction|"
+    r"on second thought|okay so|alright so|let's see|"
+    r"that said|however,|alternatively|i could|i'll just|"
+    r"maybe i|perhaps i|trying to|need to be careful)\b"
+)
+
+# 英文句子里夹着中文指令引号，是典型的"复述规则"泄漏
+_REASONING_QUOTE = re.compile(r"[\"“「'].{0,80}?(?:不要|别说|说|问|解释).{0,80}?[\"”」']")
+
+
+def _english_word_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    letters = sum(1 for ch in text if ch.isalpha())
+    ascii_letters = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    if letters == 0:
+        return 0.0
+    return ascii_letters / letters
+
+
+def strip_reasoning(text: str) -> str:
+    """剥掉混入正文的推理草稿。
+
+    策略：按句子切，从第一个"看起来像英文思考"的句子开始，
+    把后面的全部丢掉——真正的聊天回复不会在中途切成英文自言自语。
+    """
+    if not text:
+        return ""
+
+    # 按中英文句末与换行切句，保留分隔符
+    parts = re.split(r"(?<=[。！？!?~～\n])", text)
+    parts = [p for p in parts if p]
+
+    keep: list[str] = []
+    for part in parts:
+        segment = part.strip()
+        if not segment:
+            continue
+
+        # 该句英文占比很高，且出现思考标记 → 从这里断开
+        ratio = _english_word_ratio(segment)
+        if ratio > 0.5 and _REASONING_MARKERS.search(segment):
+            break
+        # 出现"复述规则"式的引号内容
+        if ratio > 0.3 and _REASONING_QUOTE.search(segment):
+            break
+        # 整句几乎全是英文（不是中英混排的短词），也视为泄漏
+        if ratio > 0.85 and len(segment) > 12:
+            break
+
+        keep.append(part)
+
+    result = "".join(keep).strip()
+    return result
+
+
 def is_self_disclosure(text: str) -> bool:
     """是否暴露了 AI 身份。"""
     return bool(_AI_SELF_DISCLOSURE.search(text))
@@ -118,6 +180,9 @@ def clean_reply(raw: str) -> str:
         return ""
 
     s = strip_markdown(raw)
+    s = strip_reasoning(s)
+    if not s.strip():
+        return ""
     # 折叠多余空白（但保留中文标点）
     s = re.sub(r"[ \t]+", " ", s)
     # 聊天不做多行：换行压平成句子

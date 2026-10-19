@@ -42,6 +42,12 @@ from companion import (
 )
 from context_builder import build_context_message
 from diary import Diary, parse_diary_from_reply
+from vision import (
+    ScreenshotStore,
+    build_image_hint,
+    capture_window,
+    has_image_placeholder,
+)
 from reply_style import clean_reply, split_messages
 
 # ----------------------------------------------------------------------------
@@ -81,10 +87,14 @@ PID_FILE = DATA_DIR / "bridge.pid"
 
 TARGET_REMARK = os.environ.get("QQ_TARGET", "你的备注名")
 POLL_MIN_S = float(os.environ.get("QQ_POLL_MIN", "5"))
-POLL_MAX_S = float(os.environ.get("QQ_POLL_MAX", "30"))
+POLL_MAX_S = float(os.environ.get("QQ_POLL_MAX", "10"))
 SEND_GAP_MIN_S = float(os.environ.get("QQ_SEND_GAP_MIN", "3"))
-SEND_GAP_MAX_S = float(os.environ.get("QQ_SEND_GAP_MAX", "8"))
+SEND_GAP_MAX_S = float(os.environ.get("QQ_SEND_GAP_MAX", "5"))
 MAX_SENDS_PER_HOUR = int(os.environ.get("QQ_MAX_SENDS_PER_HOUR", "60"))
+# QQ 服务端的硬性风控：单聊每分钟不要超过 20 条。宁可自己先刹车，也别等被限速。
+MAX_SENDS_PER_MINUTE = int(os.environ.get("QQ_MAX_SENDS_PER_MINUTE", "20"))
+# 留一点余量，实际按这个数刹车（超了腾讯会整段不回包）
+SEND_LIMIT_MARGIN = int(os.environ.get("QQ_SEND_LIMIT_MARGIN", "18"))
 MAX_REPLY_CHARS = int(os.environ.get("QQ_MAX_REPLY_CHARS", "1500"))
 DSH_TIMEOUT_S = int(os.environ.get("QQ_DSH_TIMEOUT", "600"))
 DSH_BASE_URL = os.environ.get("QQ_DSH_URL", "http://127.0.0.1:3080")
@@ -93,7 +103,6 @@ QQ_SESSION_CWD = Path(
 )
 READ_ONLY = os.environ.get("QQ_READ_ONLY", "0") == "1"
 # 打字保护：检测到用户正在输入时，最多等待多少秒
-TYPE_GUARD_MAX_WAIT_S = float(os.environ.get("QQ_TYPE_GUARD_MAX_WAIT", "90"))
 # 静默时段 "23:00-08:00"，留空则不启用
 QUIET_HOURS = os.environ.get("QQ_QUIET_HOURS", "").strip()
 # 拆条：单条最大字数
@@ -121,6 +130,26 @@ PROACTIVE_PROBABILITY = float(os.environ.get("QQ_PROACTIVE_PROB", "0.35"))
 # ── 进阶 5：印象与图库 ────────────────────────────
 IMPRESSIONS_ENABLED = os.environ.get("QQ_IMPRESSIONS_ENABLED", "1") == "1"
 GALLERY_ENABLED = os.environ.get("QQ_GALLERY_ENABLED", "1") == "1"
+
+# 会话列表滞后时，多久去读一次聊天记录做兜底（秒）
+DEEP_CHECK_INTERVAL_S = float(os.environ.get("QQ_DEEP_CHECK_INTERVAL", "8"))
+
+# 每条消息发送前的延迟区间（秒）。设成 0 0 就是收到即发
+TYPING_DELAY_MIN_S = float(os.environ.get("QQ_TYPING_DELAY_MIN", "0.0"))
+TYPING_DELAY_MAX_S = float(os.environ.get("QQ_TYPING_DELAY_MAX", "0.3"))
+
+# 秒回模式：故意慢一拍的触发概率与最长延迟
+SLOW_REPLY_PROBABILITY = float(os.environ.get("QQ_SLOW_REPLY_PROB", "0.05"))
+SLOW_REPLY_MAX_S = float(os.environ.get("QQ_SLOW_REPLY_MAX", "6"))
+
+# 打字保护：系统空闲时间低于这个秒数才算「你在用电脑」
+TYPING_IDLE_THRESHOLD_S = float(os.environ.get("QQ_TYPING_IDLE_SEC", "3"))
+# 打字保护最多等多久
+TYPING_GUARD_MAX_WAIT_S = float(os.environ.get("QQ_TYPE_GUARD_MAX_WAIT", "180"))
+
+# ── 图片理解 ──────────────────────────────────────
+VISION_ENABLED = os.environ.get("QQ_VISION_ENABLED", "1") == "1"
+SCREENSHOT_KEEP_DAYS = int(os.environ.get("QQ_SCREENSHOT_KEEP_DAYS", "2"))
 
 # ----------------------------------------------------------------------------
 # Accessibility / CoreGraphics 绑定
@@ -234,7 +263,12 @@ def ax_children(el):
 # ----------------------------------------------------------------------------
 # 日志
 # ----------------------------------------------------------------------------
+DEBUG_ENABLED = os.environ.get("QQ_DEBUG", "0") == "1"
+
+
 def log(msg: str, level: str = "INFO") -> None:
+    if level == "DEBUG" and not DEBUG_ENABLED:
+        return
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {msg}"
     print(line, flush=True)
     try:
@@ -320,17 +354,98 @@ def activate_app(pid: int) -> bool:
         return False
 
 
-def user_is_typing() -> bool:
-    """当前前台应用是否处于文本输入状态。"""
+_IOKIT = None
+
+
+def system_idle_seconds() -> float:
+    """系统空闲秒数（最近一次键盘/鼠标输入到现在）。
+
+    IOKit 的 HIDIdleTime 是纳秒。
+    """
+    global _IOKIT
     try:
-        syswide = HIS.AXUIElementCreateSystemWide()
-        focused = ax_get(syswide, "AXFocusedUIElement")
-        if not focused:
-            return False
-        role = ax_str(focused, "AXRole") or ""
-        return role in ("AXTextField", "AXTextArea", "AXComboBox")
+        if _IOKIT is None:
+            import ctypes.util as _cu
+
+            _IOKIT = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/IOKit.framework/IOKit"
+            )
+            _IOKIT.IOServiceGetMatchingService.restype = ctypes.c_uint32
+            _IOKIT.IOServiceGetMatchingService.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+            _IOKIT.IOServiceMatching.restype = ctypes.c_void_p
+            _IOKIT.IOServiceMatching.argtypes = [ctypes.c_char_p]
+            _IOKIT.IORegistryEntryCreateCFProperty.restype = ctypes.c_void_p
+            _IOKIT.IORegistryEntryCreateCFProperty.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            _IOKIT.IOObjectRelease.restype = ctypes.c_int
+            _IOKIT.IOObjectRelease.argtypes = [ctypes.c_uint32]
+
+        service = _IOKIT.IOServiceGetMatchingService(
+            0, _IOKIT.IOServiceMatching(b"IOHIDSystem")
+        )
+        if not service:
+            return 0.0
+        try:
+            # kCFAllocatorDefault=0
+            prop = _IOKIT.IORegistryEntryCreateCFProperty(
+                service, cs("HIDIdleTime"), None, 0
+            )
+            if not prop:
+                return 0.0
+            try:
+                v = ctypes.c_longlong(0)
+                CF.CFNumberGetValue.restype = ctypes.c_bool
+                CF.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                if CF.CFNumberGetValue(prop, 4, ctypes.byref(v)):  # kCFNumberSInt64Type
+                    return v.value / 1e9
+            finally:
+                CF.CFRelease(prop)
+        finally:
+            _IOKIT.IOObjectRelease(service)
     except Exception:
-        return False
+        pass
+    return 0.0
+
+
+def user_is_typing(idle_threshold: float = 0.0) -> bool:
+    """在「发送会打断你」的意义上，用户是否正在忙。
+
+    只看系统空闲时间：最近几秒内有键入/鼠标移动才算忙。
+    """
+    threshold = idle_threshold if idle_threshold > 0 else TYPING_IDLE_THRESHOLD_S
+    return system_idle_seconds() < threshold
+
+
+def wait_until_user_idle(max_wait: float = 0.0) -> tuple[bool, float]:
+    """等到用户不再操作电脑。
+
+    规则（用户指定）：发送前必须先确认"不在打字、不在移动鼠标"；
+    一旦空闲下来就**立刻**发送，不额外拖延。
+
+    - max_wait <= 0 表示一直等到空闲为止（没有上限）
+    - 返回 (是否等到, 实际等待秒数)
+    """
+    started = time.time()
+    announced = False
+    while _running:
+        idle = system_idle_seconds()
+        if idle >= TYPING_IDLE_THRESHOLD_S:
+            waited = time.time() - started
+            if waited > 0.5:
+                log(f"  你在忙，已等待 {waited:.1f}s，现在空闲了，立即发送")
+            return True, waited
+        if not announced:
+            log("  检测到你正在用电脑，等你不操作了再发", "INFO")
+            announced = True
+        if max_wait > 0 and time.time() - started >= max_wait:
+            log(f"  等待超时（{max_wait:.0f}s），仍在你操作中，放弃本次发送", "WARN")
+            return False, time.time() - started
+        time.sleep(0.2)
+    return False, time.time() - started
 
 
 # ----------------------------------------------------------------------------
@@ -511,6 +626,56 @@ class QQ:
 
         return messages
 
+    def read_chat_last_incoming(self) -> str:
+        """轻量读法：只取聊天记录里最后一条「对方」消息的文本。
+
+        用于会话列表摘要滞后时做兜底检测，避免每次都读全量记录。
+        """
+        if self.window is None:
+            return ""
+        area = self._walk(
+            self.window, lambda e: self._has_class(e, "chat-msg-area"), 0, 20
+        )
+        if not area:
+            return ""
+        items: list = []
+        self._collect(area, lambda e: self._has_class(e, "ml-item"), items, 0, 22)
+        if not items:
+            return ""
+
+        import re as _re
+
+        time_pat = _re.compile(r"^\d{1,2}:\d{2}$")
+        for item in reversed(items):
+            is_self = (
+                self._walk(
+                    item, lambda e: self._has_class(e, "message-container--self"), 0, 6
+                )
+                is not None
+            )
+            if is_self:
+                continue
+            texts: list[str] = []
+
+            def grab(el, d=0):
+                if d > 12:
+                    return
+                role = ax_str(el, "AXRole")
+                if role == "AXStaticText":
+                    v = (ax_str(el, "AXValue") or "").strip()
+                    if v and not time_pat.match(v):
+                        texts.append(v)
+                elif role == "AXImage":
+                    texts.append("[图片]")
+                for c in ax_children(el):
+                    grab(c, d + 1)
+
+            grab(item)
+            body = "\n".join(texts).strip()
+            if body:
+                return body
+        return ""
+
     def input_box(self):
         if self.window is None:
             return None
@@ -553,31 +718,88 @@ def clear_input(pid: int) -> None:
     press_key(pid, DELETE_KEY, 0, 0.05)
 
 
-def _send_one(qq: "QQ", text: str) -> bool:
-    """在 QQ 已激活、会话已打开的前提下，写入一条消息并回车。"""
-    qq.refresh()
-    box = qq.input_box()
-    if box is None:
-        log("找不到输入框", "ERROR")
+def _qq_is_frontmost(qq: "QQ") -> bool:
+    """QQ 现在是不是前台应用。
+
+    发送的每一步都依赖这个前提：一旦用户点了别的窗口，
+    键盘事件会被系统路由走，消息就发不出去。
+    """
+    try:
+        cur = front_app()
+        return bool(cur and cur[1] == qq.pid)
+    except Exception:
         return False
 
-    HIS.AXUIElementPerformAction(box, cs("AXPress"))
-    time.sleep(0.18)
-    clear_input(qq.pid)
-    time.sleep(0.12)
-    type_via_cg(qq.pid, text)
-    time.sleep(0.28)
-    press_key(qq.pid, 36)  # Return
-    time.sleep(0.35)
 
-    # 验证：输入框清空说明已发出
-    qq.refresh()
-    box2 = qq.input_box()
-    residual = (ax_str(box2, "AXValue") or "").strip()
-    if residual:
-        log(f"输入框仍有残留（{residual[:40]!r}），可能未发送", "WARN")
-        return False
-    return True
+def _send_one(qq: "QQ", text: str, max_attempts: int = 3) -> bool:
+    """写入一条消息并回车，带竞态重试。
+
+    竞态来源：桥接刚把 QQ 拉到前台，用户恰好点了屏幕，
+    焦点被抢走 → 键盘事件投递不到输入框 → 消息丢失。
+    处理办法：每次发送前确认 QQ 仍在前台，失败就重新拉前台再试。
+    """
+    for attempt in range(1, max_attempts + 1):
+        # 发送前确认前台
+        if not _qq_is_frontmost(qq):
+            log(f"  QQ 已不在前台（第 {attempt} 次），重新激活", "WARN")
+            if not activate_app(qq.pid):
+                time.sleep(0.4)
+                continue
+            time.sleep(0.45)
+
+        qq.refresh()
+        box = qq.input_box()
+        if box is None:
+            log(f"  找不到输入框（第 {attempt} 次），重试", "WARN")
+            time.sleep(0.5)
+            continue
+
+        HIS.AXUIElementPerformAction(box, cs("AXPress"))
+        time.sleep(0.18)
+
+        # 聚焦之后、输入之前再确认一次（用户点击的高发窗口）
+        if not _qq_is_frontmost(qq):
+            log(f"  聚焦后被抢走焦点（第 {attempt} 次），重试", "WARN")
+            time.sleep(0.3)
+            continue
+
+        clear_input(qq.pid)
+        time.sleep(0.12)
+        type_via_cg(qq.pid, text)
+        time.sleep(0.28)
+
+        # 回车前最后确认：如果此时焦点丢了，宁可重来也别发半截
+        if not _qq_is_frontmost(qq):
+            log(f"  回车前焦点被抢（第 {attempt} 次），清空重试", "WARN")
+            try:
+                activate_app(qq.pid)
+                time.sleep(0.4)
+                qq.refresh()
+                b2 = qq.input_box()
+                if b2 is not None:
+                    HIS.AXUIElementPerformAction(b2, cs("AXPress"))
+                    time.sleep(0.1)
+                    clear_input(qq.pid)
+            except Exception:
+                pass
+            time.sleep(0.3)
+            continue
+
+        press_key(qq.pid, 36)  # Return
+        time.sleep(0.35)
+
+        # 验证：输入框清空说明已发出
+        qq.refresh()
+        box2 = qq.input_box()
+        residual = (ax_str(box2, "AXValue") or "").strip()
+        if residual:
+            log(f"  输入框仍有残留（第 {attempt} 次）：{residual[:30]!r}", "WARN")
+            time.sleep(0.4)
+            continue
+        return True
+
+    log(f"  发送失败，{max_attempts} 次尝试均未成功", "ERROR")
+    return False
 
 
 def typing_delay(text: str, split_mode: bool = False) -> float:
@@ -591,21 +813,24 @@ def typing_delay(text: str, split_mode: bool = False) -> float:
     base = chars / cps
 
     if split_mode:
-        # 条与条之间：短一些，1~3 秒
-        delay = max(0.8, min(base, 3.0))
-        return random.uniform(delay * 0.6, delay * 1.3)
+        # 条与条之间：秒回模式下压到最小
+        delay = max(0.2, min(base, 0.6))
+        return random.uniform(delay * 0.7, delay * 1.2)
 
-    # 首次回复：加"看到消息 + 思考"的时间
-    delay = base + random.uniform(1.0, 3.0)
-    # 约 12% 概率故意慢一拍，像在忙别的事
-    if random.random() < 0.12:
-        delay += random.uniform(4.0, 10.0)
-    return min(delay, 15.0)
+    # 首次回复：加一点"看到消息"的时间（秒回模式下要小）
+    delay = base + random.uniform(0.4, 1.2)
+    # 少量概率故意慢一拍，像在忙别的事
+    if random.random() < SLOW_REPLY_PROBABILITY:
+        delay += random.uniform(3.0, 8.0)
+    return min(delay, SLOW_REPLY_MAX_S)
 
 
-def send_messages(qq: "QQ", parts: list[str]) -> list[str]:
+def send_messages(
+    qq: "QQ", parts: list[str], rate_guard=None
+) -> list[str]:
     """分多条发送，只在开头激活一次 QQ，末尾还原原前台应用。
 
+    rate_guard: 可选回调，每条发送前调用；返回 False 表示应当停止本次批量发送。
     返回实际发送成功的文本列表（供回环防护逐条记录）。
     """
     if not parts:
@@ -633,6 +858,17 @@ def send_messages(qq: "QQ", parts: list[str]) -> list[str]:
         time.sleep(0.4)
 
         for idx, part in enumerate(parts):
+            # 每条发送前检查频率（QQ 每分钟硬限制）
+            if rate_guard is not None and not rate_guard():
+                log(f"第 {idx + 1}/{len(parts)} 条因速率限制跳过", "WARN")
+                break
+
+            # 每条发送前都重新确认 QQ 在前台（用户可能中途点了别处）
+            if not _qq_is_frontmost(qq):
+                log(f"第 {idx + 1} 条发送前焦点已丢，重新激活 QQ", "WARN")
+                activate_app(qq.pid)
+                time.sleep(0.45)
+
             ok = _send_one(qq, part)
             if ok:
                 sent.append(part)
@@ -901,10 +1137,79 @@ def in_quiet_hours() -> bool:
         return False
 
 
-def rate_ok(state: dict) -> bool:
+def rate_ok(state: dict, verbose: bool = False) -> bool:
+    """发送速率是否可以继续。
+
+    两道闸：每分钟（腾讯硬限制，超了会整段限速）和每小时（自己设的总量）。
+    """
     now = time.time()
-    state["send_times"] = [t for t in state.get("send_times", []) if now - t < 3600]
-    return len(state["send_times"]) < MAX_SENDS_PER_HOUR
+    times = state.get("send_times", [])
+    # 只保留最近一小时
+    times = [t for t in times if now - t < 3600]
+    state["send_times"] = times
+
+    per_min = sum(1 for t in times if now - t < 60)
+    if per_min >= SEND_LIMIT_MARGIN:
+        if verbose:
+            log(
+                f"已达每分钟发送上限（{per_min}/{MAX_SENDS_PER_MINUTE}，"
+                f"余量刹车 {SEND_LIMIT_MARGIN}），等一分钟后继续",
+                "WARN",
+            )
+        return False
+
+    if len(times) >= MAX_SENDS_PER_HOUR:
+        if verbose:
+            log(f"已达每小时发送上限（{len(times)}/{MAX_SENDS_PER_HOUR}）", "WARN")
+        return False
+
+    return True
+
+
+def stash_pending(state: dict, parts: list[str], incoming: str) -> None:
+    """发送失败时把回复暂存起来，下一轮优先补发。"""
+    pending = state.setdefault("pending_sends", [])
+    pending.append({"parts": parts, "incoming": incoming, "at": time.time()})
+    # 只留最近 5 条，避免无限堆积
+    state["pending_sends"] = pending[-5:]
+    save_state(state)
+    log(f"  已暂存待补发（队列共 {len(state['pending_sends'])} 条）", "WARN")
+
+
+def take_pending(state: dict) -> dict | None:
+    """取出一条待补发的回复。"""
+    pending = state.get("pending_sends") or []
+    if not pending:
+        return None
+    item = pending.pop(0)
+    # 超过 10 分钟的就不补了，不然会突兀
+    if time.time() - item.get("at", 0) > 600:
+        state["pending_sends"] = pending
+        save_state(state)
+        log(f"  丢弃过期待补发（{item.get('incoming', '')[:30]!r}）", "WARN")
+        return None
+    state["pending_sends"] = pending
+    save_state(state)
+    return item
+
+
+def wait_for_rate_slot(state: dict, max_wait: float = 65.0) -> bool:
+    """发送前若已到每分钟上限，等到有位置为止（最多等 max_wait 秒）。
+
+    返回 True 表示可以发；False 表示等满了还没位置（调用方应放弃这次发送）。
+    """
+    if rate_ok(state, verbose=True):
+        return True
+    deadline = time.time() + max_wait
+    while time.time() < deadline and _running:
+        time.sleep(1.0)
+        if rate_ok(state):
+            return True
+    return False
+
+
+class _SkipSend(Exception):
+    """内部信号：本次不发送，直接进入下一轮轮询。"""
 
 
 # ----------------------------------------------------------------------------
@@ -952,7 +1257,10 @@ def main() -> int:
     log(f"  DSH 接入 : {DSH_BASE_URL} / {current_sid}")
     log(f"  模式     : {'只读（不发送）' if READ_ONLY else '自动回复'}")
     log(f"  轮询     : {POLL_MIN_S}~{POLL_MAX_S}s 随机")
-    log(f"  发送间隔 : {SEND_GAP_MIN_S}~{SEND_GAP_MAX_S}s，每小时≤{MAX_SENDS_PER_HOUR}")
+    log(
+        f"  发送间隔 : {SEND_GAP_MIN_S}~{SEND_GAP_MAX_S}s，"
+        f"每分钟≤{SEND_LIMIT_MARGIN}、每小时≤{MAX_SENDS_PER_HOUR}"
+    )
     log(f"  静默时段 : {QUIET_HOURS or '未设置'}")
     log(f"  日志     : {LOG_FILE}")
     log("=" * 62)
@@ -966,6 +1274,11 @@ def main() -> int:
     diary = Diary(QQ_SESSION_CWD, DIARY_MAX_PER_DAY) if DIARY_ENABLED else None
     impressions = Impressions(QQ_SESSION_CWD, TARGET_REMARK) if IMPRESSIONS_ENABLED else None
     gallery = Gallery(QQ_SESSION_CWD) if GALLERY_ENABLED else None
+    shots = ScreenshotStore(QQ_SESSION_CWD, SCREENSHOT_KEEP_DAYS)
+    if VISION_ENABLED:
+        cleaned = shots.cleanup()
+        log(f"图片理解已开启（截图保留 {SCREENSHOT_KEEP_DAYS} 天"
+            + (f"，清理了 {cleaned} 张旧图" if cleaned else "") + "）")
     proactive = Proactive(
         enabled=PROACTIVE_ENABLED,
         check_min_minutes=PROACTIVE_CHECK_MIN,
@@ -999,28 +1312,127 @@ def main() -> int:
                 time.sleep(10)
                 continue
 
+            # ── 优先补发上次失败的回复 ──
+            queued = take_pending(state)
+            if queued is not None:
+                log(f"发现待补发回复：{queued['parts'][0][:50]!r}")
+                if not in_quiet_hours() and wait_for_rate_slot(state, max_wait=30):
+                    got_idle, _ = wait_until_user_idle(max_wait=30)
+                    if got_idle:
+                        resent = send_messages(
+                            qq, queued["parts"], rate_guard=lambda: rate_ok(state)
+                        )
+                        if resent:
+                            last_send_at = time.time()
+                            state["send_times"].append(last_send_at)
+                            own = state.setdefault("own_sent", [])
+                            own.extend(p[:200] for p in resent)
+                            state["own_sent"] = own[-20:]
+                            save_state(state)
+                            log(f"✅ 补发成功：{resent[0][:60]!r}")
+                        else:
+                            # 再失败就放回去，下次继续
+                            stash_pending(state, queued["parts"], queued.get("incoming", ""))
+                    else:
+                        stash_pending(state, queued["parts"], queued.get("incoming", ""))
+
             info = qq.session_info(item)
+            # 主信号：会话列表摘要
             sig = f"{info['time']}|{info['preview']}"
+
+            # 辅助信号：聊天记录里最后一条「对方」消息。
+            # 必须每轮都读——QQ 的会话列表摘要经常不刷新，
+            # 只靠 sig 会漏消息（实测漏过 13 分钟）。
+            deep = ""
+            try:
+                deep = qq.read_chat_last_incoming()
+            except Exception as exc:  # noqa: BLE001
+                log(f"读取聊天记录失败：{exc}", "WARN")
+
+            last_incoming = state.get("last_incoming", "")
+            summary_changed = sig != state.get("last_sig")
+            record_changed = bool(deep) and deep != last_incoming
 
             if not state.get("initialized"):
                 state["initialized"] = True
                 state["last_sig"] = sig
+                state["last_incoming"] = deep
                 save_state(state)
                 log(f"首次同步完成，当前摘要：{info['preview'][:60]!r}")
-            elif sig != state.get("last_sig"):
-                preview_txt = info["preview"].strip()
-                # 回环防护：预览与自己刚发出的内容一致 => 是自己发的那条
-                own = state.get("own_sent") or []
-                if preview_txt and preview_txt in own:
-                    state["last_sig"] = sig
-                    save_state(state)
-                    log(f"跳过自身消息：{preview_txt[:60]!r}")
-                    time.sleep(random.uniform(POLL_MIN_S, POLL_MAX_S))
-                    continue
-
+            elif summary_changed or record_changed:
+                if record_changed and not summary_changed:
+                    log(f"会话摘要未更新，但聊天记录有新消息：{deep[:50]!r}")
+                # 只记 last_sig，防止同一轮重复检测；
+                # last_incoming 要等真正处理完（或确认是自身消息）才更新，
+                # 否则中途跳过发送会让这条消息永远丢失。
                 state["last_sig"] = sig
                 save_state(state)
                 log(f"检测到新消息：{info['preview'][:80]!r}")
+
+                # 回环防护
+                own = state.get("own_sent") or []
+
+                def _is_own(text: str) -> bool:
+                    t = (text or "").strip()
+                    if not t:
+                        return False
+                    return any(
+                        t == o.strip() or (o.strip() and o.strip().startswith(t[:20]))
+                        for o in own
+                    )
+
+                # 两个信号必须分开判断，这是去重的关键：
+                #   record_changed  = 聊天记录里出现了新的「对方」消息（可靠）
+                #   summary_changed = 会话列表摘要变了（可能只是自己刚发的那条）
+                #
+                # 曾经的 bug：只要 deep 非空就拿它当 candidate，
+                # 于是「只有摘要变成自己的回复」时，又把上一条旧消息处理一遍。
+                if record_changed:
+                    candidate = deep
+                else:
+                    # 只有摘要变了：通常是自己刚发出的消息成了预览，不该回复
+                    candidate = info["preview"].strip()
+                    if not candidate:
+                        log("无新消息（摘要为空）")
+                        time.sleep(random.uniform(POLL_MIN_S, POLL_MAX_S))
+                        continue
+                    if _is_own(candidate):
+                        log(f"仅摘要变化（自己发的）：{candidate[:50]!r}，跳过")
+                        time.sleep(random.uniform(POLL_MIN_S, POLL_MAX_S))
+                        continue
+
+                # 兜底：候选内容若是自己发过的，也跳过（防渲染方向异常）
+                if _is_own(candidate):
+                    log(f"跳过自身消息：{candidate[:60]!r}")
+                    if record_changed and deep:
+                        state["last_incoming"] = deep
+                        save_state(state)
+                    time.sleep(random.uniform(POLL_MIN_S, POLL_MAX_S))
+                    continue
+
+                # 过滤明显的误发碎片：只有标点，或单个助词（的/了/吧/啊）
+                # 注意「嗯」「好」「在」这类是正常回复，不能拦
+                stripped = re.sub(r"[\s\W_]+", "", candidate)
+                _FILLERS = set("的了吧呢啊哦嘛呀")
+                if not stripped or (len(stripped) == 1 and stripped in _FILLERS):
+                    log(f"疑似误发的碎片（{candidate!r}），跳过", "INFO")
+                    if deep:
+                        state["last_incoming"] = deep
+                        save_state(state)
+                    time.sleep(random.uniform(POLL_MIN_S, POLL_MAX_S))
+                    continue
+
+                # ── 去重：同一条消息只回复一次 ──
+                # QQ 界面渲染滞后时，read_chat_last_incoming 会反复读到
+                # 同一条旧消息，导致同一句话被回复好几遍。
+                _norm = lambda s: re.sub(r"\s+", "", (s or ""))
+                handled = state.setdefault("handled_incoming", [])
+                if _norm(candidate) in handled:
+                    log(f"该消息已处理过，跳过：{candidate[:50]!r}")
+                    time.sleep(random.uniform(POLL_MIN_S, POLL_MAX_S))
+                    continue
+
+                log(f"处理新消息：{candidate[:80]!r}")
 
                 # 切到会话读完整记录（AXPress，不激活窗口）
                 qq.open_session(item)
@@ -1072,6 +1484,18 @@ def main() -> int:
                     if snippet:
                         extras.append(snippet)
 
+                # ── 图片理解：有新图才截图 ──
+                if VISION_ENABLED and has_image_placeholder(structured):
+                    try:
+                        shot = capture_window(qq.pid, shots.new_path())
+                        if shot:
+                            log(f"  已截图：{shot.name}")
+                            extras.append(build_image_hint(shot))
+                        else:
+                            log("截图失败（检查「屏幕录制」权限）", "WARN")
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"截图异常：{exc}", "WARN")
+
                 if extras:
                     prompt_text = prompt_text + "\n\n" + "\n\n".join(extras)
 
@@ -1122,8 +1546,8 @@ def main() -> int:
                 else:
                     if in_quiet_hours():
                         log("处于静默时段，暂不发送", "INFO")
-                    elif not rate_ok(state):
-                        log("达到每小时发送上限", "WARN")
+                    elif not wait_for_rate_slot(state):
+                        log("已达发送上限且等待超时，放弃本次回复", "WARN")
                     else:
                         # ── 节奏层：拆条 + 打字延迟 + 随机敷衍 ──
                         parts = split_messages(reply, max_chars=SPLIT_MAX_CHARS)
@@ -1132,25 +1556,42 @@ def main() -> int:
                             parts = parts[:1]
                             log("  随机触发：只回第一条")
 
-                        wait_start = time.time()
-                        while user_is_typing() and time.time() - wait_start < TYPE_GUARD_MAX_WAIT_S:
-                            time.sleep(2)
-                            if not _running:
-                                break
+                        # ── 不抢控制权：等你停下键盘和鼠标再发 ──
+                        got_idle, waittime = wait_until_user_idle(TYPING_GUARD_MAX_WAIT_S)
+                        if not got_idle:
+                            log(
+                                f"你一直在操作电脑，本次跳过（拟定回复：{reply[:60]!r}）",
+                                "WARN",
+                            )
+                            raise _SkipSend()
 
                         gap = random.uniform(SEND_GAP_MIN_S, SEND_GAP_MAX_S)
                         elapsed = time.time() - last_send_at
                         if elapsed < gap:
                             time.sleep(gap - elapsed)
 
-                        # 首条前的"读消息 + 思考"延迟
-                        think = typing_delay(parts[0]) if parts else 0.0
-                        log(f"  模拟打字 {think:.1f}s")
-                        time.sleep(think)
+                        # 首条前的延迟：默认几乎为零，追求"秒回"
+                        think = random.uniform(
+                            TYPING_DELAY_MIN_S, TYPING_DELAY_MAX_S
+                        )
+                        if think > 0.05:
+                            log(f"  发送前延迟 {think:.1f}s")
+                            time.sleep(think)
 
-                        sent_parts = send_messages(qq, parts)
+                        sent_parts = send_messages(
+                            qq, parts, rate_guard=lambda: rate_ok(state)
+                        )
                         if sent_parts:
                             last_send_at = time.time()
+                            # 只有本次处理的是「聊天记录里的新消息」时才更新
+                            # last_incoming；如果是靠摘要兜底处理的，deep 还是旧值，
+                            # 更新它会让真正的新消息在下一轮被跳过。
+                            if record_changed and deep:
+                                state["last_incoming"] = deep
+                            # 记入已处理列表，防止重复回复
+                            _h = state.setdefault("handled_incoming", [])
+                            _h.append(re.sub(r"\s+", "", candidate))
+                            state["handled_incoming"] = _h[-30:]
                             state["send_times"].append(last_send_at)
                             # 回环防护：逐条记录自己发出的每一段
                             own = state.setdefault("own_sent", [])
@@ -1160,7 +1601,8 @@ def main() -> int:
                             for p in sent_parts:
                                 log(f"已发送：{p[:80]!r}")
                         else:
-                            log("发送失败", "ERROR")
+                            log("发送失败，暂存待补发", "ERROR")
+                            stash_pending(state, parts, deep)
 
             # ── 进阶 5① 主动找人（只在没有新消息可处理时） ──
             if (
@@ -1195,7 +1637,9 @@ def main() -> int:
                             if random.random() < SHORT_REPLY_PROBABILITY and len(msg_parts) > 1:
                                 msg_parts = msg_parts[:1]
                             time.sleep(typing_delay(msg_parts[0]) if msg_parts else 0)
-                            sent = send_messages(qq, msg_parts)
+                            sent = send_messages(
+                                qq, msg_parts, rate_guard=lambda: rate_ok(state)
+                            )
                             if sent:
                                 last_send_at = time.time()
                                 last_activity_ts = last_send_at
@@ -1218,6 +1662,9 @@ def main() -> int:
                 except Exception as exc:  # noqa: BLE001
                     log(f"主动发言异常：{type(exc).__name__}: {exc}", "ERROR")
 
+        except _SkipSend:
+            # 本次不发送，正常进入下一轮轮询
+            pass
         except Exception as exc:  # noqa: BLE001
             log(f"循环异常：{type(exc).__name__}: {exc}", "ERROR")
             time.sleep(5)
