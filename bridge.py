@@ -112,6 +112,21 @@ SPLIT_MAX_CHARS = int(os.environ.get("QQ_SPLIT_MAX_CHARS", "60"))
 SHORT_REPLY_PROBABILITY = float(os.environ.get("QQ_SHORT_REPLY_PROB", "0.10"))
 # 推理档位：low / high / max，留空则不设置（聊天建议 low，减少"分析腔"）
 REASONING_EFFORT = os.environ.get("QQ_REASONING_EFFORT", "low").strip()
+# 模型链：主模型在前，失败自动降级；恢复后自动切回。
+# 格式 provider/model[:effort]，逗号分隔
+MODEL_CHAIN_RAW = os.environ.get(
+    "QQ_MODEL_CHAIN",
+    "workbuddy/deepseek-v4.1-flash:low,"
+    "workbuddy/space-bunny:low,"
+    "workbuddy/glm-5.3-flash:low",
+)
+# 探测某个模型能否出字的最长等待（秒）
+MODEL_PROBE_TIMEOUT = float(os.environ.get("QQ_MODEL_PROBE_TIMEOUT", "20"))
+# 探测成功后多久内信任（秒）
+MODEL_HEALTH_OK_TTL = float(os.environ.get("QQ_MODEL_HEALTH_OK_TTL", "600"))
+# 探测失败后多久内不再试它（秒）；过了就用主模型再试一次
+MODEL_HEALTH_FAIL_TTL = float(os.environ.get("QQ_MODEL_HEALTH_FAIL_TTL", "600"))
+
 # 会话轮数上限：超过后自动新建会话并注入摘要，0 表示不限制
 MAX_SESSION_TURNS = int(os.environ.get("QQ_MAX_SESSION_TURNS", "40"))
 # 投递时附带的历史消息条数
@@ -1075,8 +1090,170 @@ def apply_reasoning_effort(api: "DshApi", sid: str) -> None:
         )
 
 
-def ask_dsh(text: str, api: "DshApi", sid: str) -> str:
-    """把消息投递到 DSH 会话，并等待该轮回复产生。"""
+# ── 模型链：主模型不可用时自动降级，恢复后自动切回 ──────────────
+def parse_model_chain(raw: str) -> list[tuple[str, str, str]]:
+    """解析 `provider/model[:effort],...` 为三元组列表。"""
+    chain: list[tuple[str, str, str]] = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        effort = ""
+        if ":" in item:
+            item, _, effort = item.rpartition(":")
+        if "/" not in item:
+            continue
+        provider, _, model = item.partition("/")
+        provider, model = provider.strip(), model.strip()
+        if not (provider and model):
+            continue
+        chain.append((provider, model, effort.strip() or REASONING_EFFORT))
+    return chain
+
+
+# 解析成实际使用的链（放在函数之后，避免定义顺序问题）
+MODEL_CHAIN = parse_model_chain(MODEL_CHAIN_RAW)
+
+
+def set_session_model(
+    api: "DshApi", sid: str, provider: str, model: str, effort: str = ""
+) -> bool:
+    """给会话指定模型。selectModel 必须同时给 provider 与 model。"""
+    req: dict = {"sessionId": sid, "provider": provider, "model": model}
+    if effort:
+        req["reasoningEffort"] = effort
+    status, data = api.rpc("session/selectModel", {"request": req})
+    return status == 200 and bool((data.get("result") or {}).get("ok"))
+
+
+def ensure_probe_session(api: "DshApi", state: dict) -> str:
+    """健康检查用的独立会话，放在 data/ 下以避开人格 AGENTS.md。"""
+    sid = state.get("probe_session_id")
+    if sid and _session_exists(api, sid) and count_turns(api, sid) < 30:
+        return sid
+
+    probe_cwd = DATA_DIR / "probe"
+    probe_cwd.mkdir(parents=True, exist_ok=True)
+    status, data = api.rpc("session/create", {"request": {"cwd": str(probe_cwd)}})
+    ok = (data.get("result") or {}).get("ok")
+    if status != 200 or not ok:
+        raise RuntimeError("无法创建健康检查会话")
+    sid = data["result"]["value"]["sessionId"]
+    api.rpc(
+        "session/rename",
+        {"request": {"sessionId": sid, "title": "模型健康检查"}},
+    )
+    state["probe_session_id"] = sid
+    save_state(state)
+    return sid
+
+
+def probe_model(
+    api: "DshApi", item: tuple[str, str, str], probe_sid: str, timeout: float
+) -> bool:
+    """给指定模型发一句极短的探测，看能不能出字。"""
+    provider, model, effort = item
+    if not set_session_model(api, probe_sid, provider, model, effort):
+        return False
+
+    before_turns = max([t.get("turn", 0) for t in _read_turns(api, probe_sid)], default=0)
+    ping = f"在吗 {uuid.uuid4().hex[:6]}"
+    status, data = api.rpc(
+        "session/prompt",
+        {
+            "request": {
+                "sessionId": probe_sid,
+                "requestId": str(uuid.uuid4()),
+                "mode": "queue",
+                "content": [{"type": "text", "text": ping}],
+            }
+        },
+    )
+    if status != 200 or not (data.get("result") or {}).get("ok"):
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline and _running:
+        time.sleep(1.2)
+        for t in reversed(_read_turns(api, probe_sid)):
+            if t.get("turn", 0) <= before_turns:
+                break
+            if (t.get("response") or "").strip():
+                return True
+    return False
+
+
+def pick_working_model(
+    api: "DshApi", state: dict
+) -> tuple[str, str, str] | None:
+    """按链顺序挑一个能用的模型。
+
+    主模型失败后会被记进 model_health，FAIL_TTL 内不再探测它；
+    过了 TTL 会重新试一次，成功就自动切回主模型。
+    """
+    health = state.setdefault("model_health", {})
+    now = time.time()
+
+    try:
+        probe_sid = ensure_probe_session(api, state)
+    except Exception as exc:  # noqa: BLE001
+        log(f"健康检查会话不可用，直接按链顺序尝试：{exc}", "WARN")
+        probe_sid = ""
+
+    for item in MODEL_CHAIN:
+        provider, model, effort = item
+        key = f"{provider}/{model}"
+        rec = health.get(key) or {}
+        ok_flag = rec.get("ok")
+        checked_at = float(rec.get("at") or 0)
+        ttl = MODEL_HEALTH_OK_TTL if ok_flag else MODEL_HEALTH_FAIL_TTL
+
+        if ok_flag is not None and now - checked_at < ttl:
+            if ok_flag:
+                return item
+            continue  # 最近确认失败，且还在冷却期
+
+        if not probe_sid:
+            # 没法探测就只能盲试，由调用方的空回复判定兜底
+            return item
+
+        good = probe_model(api, item, probe_sid, MODEL_PROBE_TIMEOUT)
+        health[key] = {"ok": good, "at": time.time()}
+        save_state(state)
+        if good:
+            if key != MODEL_CHAIN[0][0] + "/" + MODEL_CHAIN[0][1]:
+                log(f"主模型不可用，降级到 {key}")
+            elif rec.get("ok") is False:
+                log(f"主模型已恢复：{key}")
+            return item
+        log(f"模型 {key} 探测失败，尝试下一个", "WARN")
+
+    log("模型链里所有模型都不可用", "ERROR")
+    return None
+
+
+def mark_model_bad(state: dict, model: tuple[str, str, str]) -> None:
+    """把某个模型标记为当前不可用，下一轮会重新探链。"""
+    key = f"{model[0]}/{model[1]}"
+    state.setdefault("model_health", {})[key] = {"ok": False, "at": time.time()}
+    save_state(state)
+
+
+def ask_dsh(
+    text: str,
+    api: "DshApi",
+    sid: str,
+    model: tuple[str, str, str] | None = None,
+) -> str:
+    """把消息投递到 DSH 会话，并等待该轮回复产生。
+
+    model 不为空时，投递前先把会话切到该模型（故障切换用）。
+    """
+    if model:
+        provider, name, effort = model
+        if not set_session_model(api, sid, provider, name, effort):
+            log(f"切换模型 {provider}/{name} 失败", "WARN")
+
     before = _read_turns(api, sid)
     before_turns = max([t.get("turn", 0) for t in before], default=0)
 
@@ -1280,6 +1457,14 @@ def main() -> int:
     gallery = Gallery(QQ_SESSION_CWD) if GALLERY_ENABLED else None
     shots = ScreenshotStore(QQ_SESSION_CWD, SCREENSHOT_KEEP_DAYS)
     schedule = Schedule(QQ_SESSION_CWD) if SCHEDULE_ENABLED else None
+    if MODEL_CHAIN:
+        desc = " → ".join(f"{p}/{m}" for p, m, _ in MODEL_CHAIN)
+        log(f"模型链: {desc}")
+        log(f"  探测超时 {MODEL_PROBE_TIMEOUT:.0f}s，成功缓存 {MODEL_HEALTH_OK_TTL:.0f}s，"
+            f"失败冷却 {MODEL_HEALTH_FAIL_TTL:.0f}s")
+    else:
+        log("模型链为空，将使用会话默认模型", "WARN")
+
     if schedule is not None:
         if schedule.ok:
             n = len(schedule._classes())  # noqa: SLF001
@@ -1525,9 +1710,21 @@ def main() -> int:
                 except Exception as exc:  # noqa: BLE001
                     log(f"会话轮转失败（继续用旧会话）: {exc}", "WARN")
 
-                raw_reply = ask_dsh(prompt_text, api, current_sid)
+                # ── 选模型：主模型不可用则降级，恢复后自动切回 ──
+                chosen = pick_working_model(api, state)
+                if chosen is None:
+                    log(
+                        "模型链全部不可用，30 秒后重试（消息不会丢，"
+                        "恢复后会自动补回）",
+                        "ERROR",
+                    )
+                    time.sleep(30)
+                    continue
+
+                raw_reply = ask_dsh(prompt_text, api, current_sid, chosen)
                 if not raw_reply:
-                    log("DSH 无输出", "WARN")
+                    log(f"DSH 无输出（{chosen[0]}/{chosen[1]}），标记为不可用", "WARN")
+                    mark_model_bad(state, chosen)
 
                 # ── 从回复里提取日记 / 印象 / 图库动作 ──
                 if raw_reply:
@@ -1642,7 +1839,14 @@ def main() -> int:
                         parts_prompt.append(proactive.prompt_snippet())
                         ask_text = "\n\n".join(parts_prompt)
 
-                        proactive_reply = ask_dsh(ask_text, api, current_sid)
+                        p_model = pick_working_model(api, state)
+                        if p_model is None:
+                            log("模型链全部不可用，跳过主动发言", "WARN")
+                            proactive_reply = ""
+                        else:
+                            proactive_reply = ask_dsh(
+                                ask_text, api, current_sid, p_model
+                            )
                         cleaned = clean_reply(proactive_reply) if proactive_reply else ""
 
                         if not cleaned or "SILENT" in (proactive_reply or "").upper():

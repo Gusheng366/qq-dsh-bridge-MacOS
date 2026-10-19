@@ -5,11 +5,12 @@
 
 **交接时的运行状态（10:30）**：
 
-- 桥接进程：**已停止**——**模型额度耗尽，用户要求先不调用**
-- `workbuddy / deepseek-v4.1-flash` 现在调用会返回空回复（额度用完）
-- `deepseek-official`（DeepSeek 官方 key）和 `workbuddy / hy3` 仍可用
-- 代码：Bug 1 已修；课程表已接入
-- 已本地提交到 `0befda3`，**未 push**（用户明确要求「我说推你再推」）
+- 桥接进程：**已停止**
+- `workbuddy / deepseek-v4.1-flash` 调用返回空回复（额度用完）
+- **已实现模型链自动故障切换**：主模型不可用自动降级，恢复后自动切回
+- 实测可用的备用：`space-bunny`（3~6s，x0.08）、`glm-5.3-flash`（6s，x0.06）
+- 代码：Bug 1 已修；课程表已接入；模型链已接入
+- 本地提交（**未 push**，用户明确要求「我说推你再推」）
 
 > ⚠️ **重启桥接前先确认额度已恢复**，否则每条消息都会走一次失败的模型调用。
 > 验证方法见第十节「额度耗尽怎么判断」。
@@ -376,6 +377,49 @@ QQ 是 Chromium 系，AX 树完整。实测可靠的定位方式：
 
 实测效果：「你是谁啊」→「我啊，就一网友，你谁啊」；「你是不是AI」→「你才AI」。
 
+### 7.5 模型链与故障切换
+
+**需求**：主模型没 token 时自动换备用；主模型恢复后自动切回。
+
+**实现**（`bridge.py` 的 `parse_model_chain` / `probe_model` / `pick_working_model`）：
+
+```
+QQ_MODEL_CHAIN=workbuddy/deepseek-v4.1-flash:low,workbuddy/space-bunny:low,workbuddy/glm-5.3-flash:low
+```
+
+1. **健康探测**：用独立的探测会话（cwd 是 `data/probe`，故意避开人格 `AGENTS.md`）
+   给每个模型发一句 `在吗 <随机>`，20 秒内出字就算可用。
+2. **缓存**：结果写进 `state["model_health"]`，成功/失败各缓存 10 分钟。
+   失败的模型在冷却期内不再探测，避免每条消息都白等。
+3. **自动切回**：冷却期过后，下一次发消息会**重新从链首探测**，主模型恢复就自动用回它。
+4. **兜底**：如果真实投递后回复为空（探测没抓到的临时故障），
+   立刻 `mark_model_bad()` 把它标失败，下一条消息自然换下一个。
+5. **全挂**：所有模型都不可用时**不投递**（避免在会话里留下空回合污染历史），
+   睡 30 秒后重试，消息不会丢。
+
+**实测（2026-10-19 10:40，主模型额度耗尽时）**：
+
+```
+[WARN] 模型 workbuddy/deepseek-v4.1-flash 探测失败，尝试下一个
+[INFO] 主模型不可用，降级到 workbuddy/space-bunny
+选中 ('workbuddy', 'space-bunny', 'low') | 耗时 23.2s
+投递耗时 6.1s
+回复: '有啊，下午两点半和四点半，都在503'   ← 课表答对了
+```
+
+**模型适配聊天实测**（同一句「好饿啊 下午还有课不想上了」）：
+
+| 模型 | 延迟 | 回复 | 价格 |
+|---|---|---|---|
+| `space-bunny` | **3.1s** | 那你就翘啊，反正饿着也听不进去 `DIARY: ...` | x0.08 |
+| `glm-5.3-flash` | 6.1s | 饿就对了 不想上就摸鱼呗 反正也就一下午 | x0.06 |
+| `hy3-x` | 7.6s | 饿就去吃呗 逃就逃了呗 又没人绑着你 | x0.05 |
+| `step-5-preview` | 12.1s | 翘了呗 反正去了也不听 | 免费 |
+| `hy3` | 26.6s | 青蛙还在哭呢 | 免费 |
+
+选 `space-bunny` + `glm-5.3-flash` 做备用：最快、便宜，且都认 `AGENTS.md` 的
+`DIARY:` / `IMPRESSION:` 标记格式（space-bunny 首次测试就自动写了日记）。
+
 ---
 
 ## 八、配置参数（当前生效值）
@@ -394,6 +438,10 @@ QQ 是 Chromium 系，AX 树完整。实测可靠的定位方式：
 | `QQ_SPLIT_MAX_CHARS` | 60 | 拆条字数 |
 | `QQ_SHORT_REPLY_PROB` | 0.10 | 只回第一条的概率 |
 | `QQ_REASONING_EFFORT` | `low` | 推理档位（`off` 不被 workbuddy 支持） |
+| `QQ_MODEL_CHAIN` | 主+2备 | 模型链，逗号分隔，见 7.5 |
+| `QQ_MODEL_PROBE_TIMEOUT` | 20 | 探测能否出字的最长等待（秒） |
+| `QQ_MODEL_HEALTH_OK_TTL` | 600 | 探测成功后信任多久（秒） |
+| `QQ_MODEL_HEALTH_FAIL_TTL` | 600 | 失败后多久再试（秒），到了会自动重试主模型 |
 | `QQ_MAX_SESSION_TURNS` | 40 | 轮数超限换新会话 |
 | `QQ_CONTEXT_HISTORY` | 6 | 投递时带几条历史 |
 | `QQ_DIARY_ENABLED` | 1 | 日记开关 |
