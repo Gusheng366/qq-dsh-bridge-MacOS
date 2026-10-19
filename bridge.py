@@ -127,6 +127,11 @@ MODEL_HEALTH_OK_TTL = float(os.environ.get("QQ_MODEL_HEALTH_OK_TTL", "600"))
 # 探测失败后多久内不再试它（秒）；过了就用主模型再试一次
 MODEL_HEALTH_FAIL_TTL = float(os.environ.get("QQ_MODEL_HEALTH_FAIL_TTL", "600"))
 
+# 多久没检测到变化就轻点一下会话项，促使 QQ 重绘 AX 树（秒）
+AX_POKE_AFTER_S = float(os.environ.get("QQ_AX_POKE_AFTER", "45"))
+# 同一轮里重试读取的次数（AX 树可能刚重建完还没填好）
+READ_RETRIES = int(os.environ.get("QQ_READ_RETRIES", "3"))
+
 # 会话轮数上限：超过后自动新建会话并注入摘要，0 表示不限制
 MAX_SESSION_TURNS = int(os.environ.get("QQ_MAX_SESSION_TURNS", "40"))
 # 投递时附带的历史消息条数
@@ -224,6 +229,7 @@ CG.CGEventSetFlags.restype = None
 CG.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 
 TRUE = ctypes.c_void_p.in_dll(CF, "kCFBooleanTrue")
+FALSE = ctypes.c_void_p.in_dll(CF, "kCFBooleanFalse")
 
 
 def cs(s: str) -> ctypes.c_void_p:
@@ -484,9 +490,16 @@ class QQ:
             self.app = None
             self.window = None
             return False
+
+        # 注意：不要切 AXManualAccessibility=FALSE 再开——实测会把 QQ 的
+        # 无障碍树彻底关掉，之后连 AXWindows 下的内容都读不出来。
+        # 只在首次（或 pid 变化时）创建应用对象，之后复用。
+        now = time.time()
         if self.pid != pid or self.app is None:
             self.pid = pid
             self.app = HIS.AXUIElementCreateApplication(pid)
+            self._app_born = now
+
         HIS.AXUIElementSetAttributeValue(self.app, cs("AXManualAccessibility"), TRUE)
         wins = ax_get(self.app, "AXWindows")
         if not wins:
@@ -1484,6 +1497,7 @@ def main() -> int:
         quiet_hours=QUIET_HOURS,
     )
     last_activity_ts = time.time()
+    state.setdefault("_last_change_ts", time.time())
     if DIARY_ENABLED:
         log(f"日记已开启（今日 {diary.count_today()}/{DIARY_MAX_PER_DAY}）")
     if PROACTIVE_ENABLED:
@@ -1549,6 +1563,17 @@ def main() -> int:
             summary_changed = sig != state.get("last_sig")
             record_changed = bool(deep) and deep != last_incoming
 
+            # 轮询心跳：DEBUG 模式下每 10 轮打一次，确认它真的在读、读到什么
+            poll_count = state.get("_poll_count", 0) + 1
+            state["_poll_count"] = poll_count
+            if DEBUG_ENABLED and poll_count % 10 == 1:
+                log(
+                    f"[轮询 {poll_count}] sig={sig[:40]!r} deep={deep[:30]!r} "
+                    f"last_sig={str(state.get('last_sig'))[:40]!r} "
+                    f"last_incoming={last_incoming[:30]!r}",
+                    "DEBUG",
+                )
+
             if not state.get("initialized"):
                 state["initialized"] = True
                 state["last_sig"] = sig
@@ -1556,6 +1581,7 @@ def main() -> int:
                 save_state(state)
                 log(f"首次同步完成，当前摘要：{info['preview'][:60]!r}")
             elif summary_changed or record_changed:
+                state["_last_change_ts"] = time.time()
                 if record_changed and not summary_changed:
                     log(f"会话摘要未更新，但聊天记录有新消息：{deep[:50]!r}")
                 # 只记 last_sig，防止同一轮重复检测；
@@ -1815,6 +1841,20 @@ def main() -> int:
                         else:
                             log("发送失败，暂存待补发", "ERROR")
                             stash_pending(state, parts, deep)
+
+            # ── 长时间无变化时轻点一次会话项 ──
+            # Chromium 的 AX 树在窗口长期处于后台时会停止更新，
+            # 桥接就会一直读到旧摘要（实测漏过 5 分钟）。
+            # AXPress 只是切换 QQ 内的会话，不会激活应用、不抢焦点。
+            if _running and AX_POKE_AFTER_S > 0:
+                idle_for = time.time() - state.get("_last_change_ts", 0)
+                if idle_for > AX_POKE_AFTER_S:
+                    try:
+                        qq.open_session(item)
+                        state["_last_change_ts"] = time.time()
+                        log(f"已 {idle_for:.0f}s 无变化，轻点会话项刷新界面缓存", "DEBUG")
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"刷新界面缓存失败：{exc}", "WARN")
 
             # ── 进阶 5① 主动找人（只在没有新消息可处理时） ──
             if (
