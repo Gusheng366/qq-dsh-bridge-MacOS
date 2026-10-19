@@ -49,6 +49,7 @@ from vision import (
     has_image_placeholder,
 )
 from reply_style import clean_reply, split_messages
+from schedule import Schedule
 
 # ----------------------------------------------------------------------------
 # 配置
@@ -146,6 +147,9 @@ SLOW_REPLY_MAX_S = float(os.environ.get("QQ_SLOW_REPLY_MAX", "6"))
 TYPING_IDLE_THRESHOLD_S = float(os.environ.get("QQ_TYPING_IDLE_SEC", "3"))
 # 打字保护最多等多久
 TYPING_GUARD_MAX_WAIT_S = float(os.environ.get("QQ_TYPE_GUARD_MAX_WAIT", "180"))
+
+# ── 课程表 ────────────────────────────────────────
+SCHEDULE_ENABLED = os.environ.get("QQ_SCHEDULE_ENABLED", "1") == "1"
 
 # ── 图片理解 ──────────────────────────────────────
 VISION_ENABLED = os.environ.get("QQ_VISION_ENABLED", "1") == "1"
@@ -1275,6 +1279,13 @@ def main() -> int:
     impressions = Impressions(QQ_SESSION_CWD, TARGET_REMARK) if IMPRESSIONS_ENABLED else None
     gallery = Gallery(QQ_SESSION_CWD) if GALLERY_ENABLED else None
     shots = ScreenshotStore(QQ_SESSION_CWD, SCREENSHOT_KEEP_DAYS)
+    schedule = Schedule(QQ_SESSION_CWD) if SCHEDULE_ENABLED else None
+    if schedule is not None:
+        if schedule.ok:
+            n = len(schedule._classes())  # noqa: SLF001
+            log(f"课程表已加载（{n} 节课）")
+        else:
+            log("课程表未找到（qq-workspace/课程表/schedule.json）", "WARN")
     if VISION_ENABLED:
         cleaned = shots.cleanup()
         log(f"图片理解已开启（截图保留 {SCREENSHOT_KEEP_DAYS} 天"
@@ -1481,6 +1492,10 @@ def main() -> int:
                         extras.append("【你的图库】\n" + gal)
                 if diary:
                     snippet = diary.diary_prompt_snippet()
+                    if snippet:
+                        extras.append(snippet)
+                if schedule is not None:
+                    snippet = schedule.prompt_snippet()
                     if snippet:
                         extras.append(snippet)
 
