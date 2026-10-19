@@ -125,7 +125,7 @@ class Schedule:
         todays = self.classes_on(today)
         if todays:
             lines.append(
-                f"今天（{today.month}月{today.day}日 {WEEKDAYS[today.weekday()]}）{len(todays)}节："
+                f"他今天（{today.month}月{today.day}日 {WEEKDAYS[today.weekday()]}）{len(todays)}节："
             )
             for c in todays:
                 state = self._state_of(c, now)
@@ -134,14 +134,14 @@ class Schedule:
                     item += f" —— {state}"
                 lines.append(item)
         else:
-            lines.append("今天没课")
+            lines.append("他今天没课")
 
         # 明天
         tomorrow = today + timedelta(days=1)
         tmr = self.classes_on(tomorrow)
         if tmr:
             lines.append(
-                f"明天（{tomorrow.month}月{tomorrow.day}日 {WEEKDAYS[tomorrow.weekday()]}）{len(tmr)}节："
+                f"他明天（{tomorrow.month}月{tomorrow.day}日 {WEEKDAYS[tomorrow.weekday()]}）{len(tmr)}节："
             )
             for c in tmr:
                 lines.append("  " + self._fmt_class(c))
@@ -156,7 +156,7 @@ class Schedule:
                 if delta == 0
                 else ("明天" if delta == 1 else f"{d.month}月{d.day}日{WEEKDAYS[d.weekday()]}")
             )
-            lines.append(f"下一节：{when} {nxt['start']}-{nxt['end']} {nxt['name']}")
+            lines.append(f"他下一节：{when} {nxt['start']}-{nxt['end']} {nxt['name']}")
         elif not todays and not tmr:
             lines.append("近期没有课了")
 
@@ -165,15 +165,19 @@ class Schedule:
         week = [(d, n) for d, n in week if d != today and d != tomorrow]
         if week:
             parts = [f"{d.month}/{d.day}{WEEKDAYS[d.weekday()]}({n}节)" for d, n in week]
-            lines.append("这周还有课：" + "、".join(parts))
+            lines.append("他这周还有课：" + "、".join(parts))
 
         if not lines:
             return ""
 
         return (
-            "【课表】\n"
+            "【他的课表（不是你的，你自己没有课）】\n"
+            "下面这些是跟你聊天这个人的课，不是你自己的。\n"
             + "\n".join(lines)
-            + "\n★几条规矩：每节课都有开始和下课时间；说「现在」时要看清哪一节"
-            "正在上（★标记）、几点下课，不要把后面那节的时间当成现在。"
-            "这些你心里有数就行，别像日程助手那样汇报，也别主动念整张表。"
+            + "\n★几条规矩：\n"
+            "1. 这是**他的**课表。说的时候要用「你」，不能用「我」。\n"
+            "   正确：「你 11:40 才下课」；错误：「我这节课 11:40 才下」。\n"
+            "2. 每节课都有开始和下课时间；说「现在」要看清哪节正在上（★标记）、"
+            "几点下课，不要把后面那节的时间当成现在。\n"
+            "3. 你心里有数就行，别像日程助手那样汇报，也别主动念整张表。"
         )
